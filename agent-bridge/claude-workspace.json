@@ -1,0 +1,42 @@
+{
+  "id": "claude-workspace",
+  "name": "Claude Workspace",
+  "icon": "sparkles",
+  "colorHex": "#0F6B6B",
+  "summary": "A standing place for work shared with Claude.",
+  "detail": "One project, two standing tasks, and a smart list. Everything else is the app's normal furniture — assignment, comments, subtasks — so it works on the phone with no new UI.",
+  "version": 1,
+  "projects": [
+    {
+      "id": "claude",
+      "name": "Claude",
+      "icon": "sparkles",
+      "colorHex": "#0F6B6B",
+      "category": "Work",
+      "summary": "Work shared with Claude.",
+      "detail": "Assign a task to \"Claude\" to put it in the queue. Comment on a task to say something; Claude replies in the same thread and you get a notification.",
+      "tasks": [
+        {
+          "title": "Briefing",
+          "assignee": "Claude",
+          "priority": "Medium",
+          "daysFromStart": 365,
+          "pinnedNote": "Idle — nothing in flight.",
+          "notes": "The standing thread. Claude keeps the pinned note above current: what it is working on, what it last finished, what it is waiting on. Comment here to ask for something; the reply arrives in this thread and raises a notification on your phone.\n\nThe due date is parked a year out on purpose. This is a standing thread, not a deadline, and an overdue badge on it every morning would be noise.",
+          "subtasks": [],
+          "tags": ["claude"]
+        },
+        {
+          "title": "How this works",
+          "assignee": "",
+          "priority": "Low",
+          "daysFromStart": 365,
+          "pinnedNote": "",
+          "notes": "Conventions, so you don't have to remember them.\n\nTO GIVE CLAUDE WORK — assign a task to \"Claude\". Anything assigned to Claude and not completed shows up in `wf queue`. It works from the phone: open a task, set the assignee, done.\n\nTO SAY SOMETHING — comment on any task. `wf poll` reports comments Claude hasn't seen, ignoring its own. Claude replies in the same thread and you get a notification, because an agent reply is treated as addressed to you without needing an @mention.\n\nTO SEE WHAT IT HAS — Projects → Smart Lists → Claude. That's a saved filter on assignee, so it stays current on its own.\n\nTO FOLLOW A LONG JOB — Claude ticks subtasks as it goes and keeps the pinned note current, so a task's own row tells you where things stand.\n\nWHAT IT WON'T DO — delete anything. There is no destructive command, deliberately. And nothing moves while WorkFlow is closed on the Mac, in either direction.",
+          "subtasks": [],
+          "tags": ["claude"]
+        }
+      ]
+    }
+  ]
+}

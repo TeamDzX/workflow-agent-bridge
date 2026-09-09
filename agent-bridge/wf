@@ -1,0 +1,1697 @@
+#!/usr/bin/env python3
+"""wf — talk to WorkFlow's Agent Bridge from the command line.
+
+The minimum writer side for the bridge: send commands, wait for receipts, and
+read tasks and comment threads.
+
+Reads come from `snapshot.json` in the bridge folder — the app's own export of
+tasks, comments, checklists and notes, rewritten after every save. That matters
+more than it looks: the SQLite store sits inside the app's sandbox container,
+which a background process (a launchd-started session, say) cannot open at all.
+The snapshot lives wherever the bridge does, so it's readable from anywhere.
+When there is no snapshot yet, reads fall back to the store, read-only.
+
+Writes always go through the app (a command file it drains). Never write to
+the store: Core Data logs every save into persistent-history tables and
+NSPersistentCloudKitContainer exports from that log — a raw INSERT lands on this
+Mac and never reaches the phone.
+
+Where the bridge is, in order:
+  1. $WF_BRIDGE                      — set explicitly (the wake script does this)
+  2. the app's location.json pointer — inside the container; a terminal can read it
+  3. the container itself            — where the bridge lives until a folder is chosen
+
+Usage
+  wf state                          Bridge status, folder, snapshot age
+  wf ping                           Confirm the app is watching
+  wf setup                          Install the agent workspace and its smart list
+  wf wake install|status|uninstall  launchd trigger: assigning a task wakes Claude
+  wf tasks [--all]                  List active tasks
+  wf queue                          Tasks assigned to the agent
+  wf show <task>                    One task with its comment thread
+  wf comment <task> <text>          Post a comment as the agent
+  wf poll [--since ISO8601]         Comments addressed to the agent since a mark
+  wf add <title> [...]              Create a task
+  wf check|uncheck <task> <sub>...  Tick subtasks
+  wf rename <task> <old> <new>      Retitle a subtask in place (tick kept)
+  wf status <task> <text>           Set a task's pinned note (its status line)
+  wf done <task>                    Complete a task
+  wf project <name> [...]           Create or update a project
+  wf pack <file.json>               Install a ProjectPack
+  wf notes [--all]                  The Notepad inbox
+  wf note <note>                    One note in full
+  wf jot <title> [--body TEXT]      File output into the Notepad
+  wf convert <note> [--subtask S]   Promote a note into a task
+  wf reply <note> <text>            Append a signed reply inside the note
+  wf attach <task> <file> [--name N] Attach a file to a task
+  wf sweep [--apply] [--json]        Portfolio sweep: notes → per-app fixes, versions
+  wf sweep install|status|uninstall  Weekly launchd job that runs the sweep in a session
+  wf session [CODEBASE]             Claude's own cross-session log for this codebase
+  wf session --log TEXT             Append a session comment (creates the task on first use)
+  wf session --state TEXT           Replace the one-line current state
+  wf session --open S / --close S   Add / tick an open loop
+  wf session --list                 Every codebase with its state line
+  wf session --attach FILE [--to T] Attach evidence (screenshot, report, export) and say where it came from
+  wf session --weekly               Post the week's session counts on the housekeeping task
+  wf handoff TITLE [--project P] [--notes/--command ...]  A task for you, tagged needs-<you>
+  wf job TITLE [--template T] [--step S...]  A checklist task Claude ticks as it works
+
+<task> / <note> is an id or a case-insensitive fragment of the title.
+"""
+
+import argparse
+import getpass
+import json
+import os
+import plistlib
+import sqlite3
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+# The Mac app's own container. WF_CONTAINER overrides it — useful against a
+# simulator install, or a second copy of the app.
+CONTAINER = Path(
+    os.environ.get(
+        "WF_CONTAINER",
+        Path.home() / "Library/Containers/mac.TeamDZX.worflow/Data/Library/Application Support",
+    )
+)
+
+AGENT_AUTHOR_ID = "agent.claude"
+AGENT_NAME = "Claude"
+NOTE_MARKER = "@claude"
+
+# Resolved once. There is a symlink to the repo on the Desktop for convenience,
+# and macOS keeps background processes out of the Desktop — so every path this
+# tool bakes into launchd config must be the real one, never the path it
+# happened to be invoked through.
+HERE = Path(__file__).resolve().parent
+WORKSPACE_PACK = HERE / "claude-workspace.json"
+
+# Core Data stores seconds since 2001-01-01, not the Unix epoch.
+APPLE_EPOCH_OFFSET = 978307200
+EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def resolve_bridge():
+    explicit = os.environ.get("WF_BRIDGE")
+    if explicit:
+        return Path(explicit)
+    pointer = CONTAINER / "AgentBridge" / "location.json"
+    try:
+        root = json.loads(pointer.read_text()).get("root")
+        if root and Path(root).is_dir():
+            return Path(root)
+    except (OSError, ValueError):
+        pass
+    return CONTAINER / "AgentBridge"
+
+
+BRIDGE = resolve_bridge()
+INBOX, OUTBOX = BRIDGE / "inbox", BRIDGE / "outbox"
+ATTACHMENTS = BRIDGE / "attachments"
+STATE, SNAPSHOT = BRIDGE / "state.json", BRIDGE / "snapshot.json"
+WATERMARK = BRIDGE / ".wf-watermark"
+
+
+def die(msg, code=1):
+    print(f"wf: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def read_state():
+    try:
+        return json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+# ------------------------------------------------------------------ reading
+
+def parse_iso(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def apple_time(seconds):
+    if seconds is None:
+        return None
+    return datetime.fromtimestamp(seconds + APPLE_EPOCH_OFFSET, tz=timezone.utc)
+
+
+def uuid_str(value):
+    """ZID is a 16-byte BLOB, not text — Core Data stores UUIDs raw."""
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return str(uuid.UUID(bytes=bytes(value)))
+        except ValueError:
+            return None
+    return str(value)
+
+
+def load_snapshot():
+    try:
+        return json.loads(SNAPSHOT.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def live_store():
+    """Which store the app actually opened — the fallback when there's no
+    snapshot. state.json says so outright when the bridge is on; otherwise
+    the most recently written store file, because this Mac runs on
+    freshStore.store rather than default.store."""
+    path = read_state().get("storePath")
+    if path and Path(path).exists():
+        return Path(path)
+    candidates = []
+    for store in CONTAINER.glob("*.store"):
+        wal = store.with_name(store.name + "-wal")
+        mtime = max(store.stat().st_mtime, wal.stat().st_mtime if wal.exists() else 0)
+        candidates.append((mtime, store))
+    if not candidates:
+        die("no snapshot in the bridge folder and no SwiftData store under "
+            f"{CONTAINER}\n     Is WorkFlow running with Settings > Agent Bridge on?")
+    return max(candidates)[1]
+
+
+def query(sql, params=()):
+    uri = f"file:{live_store()}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.OperationalError as exc:
+        die(f"couldn't open the store ({exc}). A background session can't reach "
+            "the app's container — choose a Bridge Folder in WorkFlow's Settings "
+            "so the app writes snapshot.json somewhere readable.")
+    try:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+
+def _blob_json(blob):
+    if not blob:
+        return []
+    try:
+        return json.loads(bytes(blob).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return []
+
+
+def _comment(c, ts):
+    return {"id": c.get("id"), "author": c.get("author", "?"), "authorID": c.get("authorID"),
+            "text": c.get("text", ""), "ts": ts}
+
+
+def all_tasks(include_hidden=False):
+    """Every task as a plain dict, from the snapshot if there is one."""
+    snap = load_snapshot()
+    rows = []
+    if snap is not None:
+        for t in snap.get("tasks", []):
+            if not include_hidden and t.get("isHidden"):
+                continue
+            rows.append({
+                "id": (t.get("id") or "").lower(),
+                "title": t.get("title", ""),
+                "status": t.get("status", ""),
+                "priority": t.get("priority", ""),
+                "project": t.get("project", ""),
+                "assignee": t.get("assignee", ""),
+                "due": parse_iso(t.get("dueDate")),
+                "updated": parse_iso(t.get("updatedAt")),
+                "pinnedNote": t.get("pinnedNote", ""),
+                "notes": t.get("notes", ""),
+                "subtasks": t.get("subtasks", []),
+                "comments": sorted((_comment(c, parse_iso(c.get("timestamp")))
+                                    for c in t.get("comments", [])),
+                                   key=lambda c: c["ts"] or EPOCH),
+            })
+    else:
+        clause = "" if include_hidden else "WHERE ZISMINIMIZED = 0 AND ZARCHIVEDAT IS NULL"
+        for r in query(f"SELECT ZID, ZTITLE, ZSTATUS, ZPRIORITY, ZPROJECT, ZASSIGNEE, ZDUEDATE, "
+                       f"ZUPDATEDAT, ZPINNEDNOTE, ZSTRIPPEDNOTES, ZNOTES, ZSUBTASKSDATA, "
+                       f"ZCOMMENTSDATA FROM ZPMTASK {clause}"):
+            rows.append({
+                "id": (uuid_str(r["ZID"]) or "").lower(),
+                "title": r["ZTITLE"] or "",
+                "status": r["ZSTATUS"] or "",
+                "priority": r["ZPRIORITY"] or "",
+                "project": r["ZPROJECT"] or "",
+                "assignee": r["ZASSIGNEE"] or "",
+                "due": apple_time(r["ZDUEDATE"]),
+                "updated": apple_time(r["ZUPDATEDAT"]),
+                "pinnedNote": r["ZPINNEDNOTE"] or "",
+                "notes": r["ZSTRIPPEDNOTES"] or r["ZNOTES"] or "",
+                "subtasks": _blob_json(r["ZSUBTASKSDATA"]),
+                "comments": sorted((_comment(c, apple_time(c.get("timestamp")))
+                                    for c in _blob_json(r["ZCOMMENTSDATA"])),
+                                   key=lambda c: c["ts"] or EPOCH),
+            })
+    return sorted(rows, key=lambda r: r["updated"] or EPOCH, reverse=True)
+
+
+def all_notes(include_archived=False):
+    snap = load_snapshot()
+    rows = []
+    if snap is not None:
+        for n in snap.get("notes", []):
+            if not include_archived and n.get("isArchived"):
+                continue
+            rows.append({
+                "id": (n.get("id") or "").lower(),
+                "title": n.get("title", ""), "body": n.get("body", ""),
+                "isPinned": bool(n.get("isPinned")), "isArchived": bool(n.get("isArchived")),
+                "convertedAt": parse_iso(n.get("convertedAt")),
+                "convertedTargetName": n.get("convertedTargetName", ""),
+                "updated": parse_iso(n.get("updatedAt")),
+            })
+    else:
+        clause = "" if include_archived else "WHERE ZISARCHIVED = 0"
+        for r in query(f"SELECT ZID, ZTITLE, ZBODY, ZISPINNED, ZISARCHIVED, ZCONVERTEDAT, "
+                       f"ZCONVERTEDTARGETNAME, ZUPDATEDAT FROM ZPMNOTE {clause}"):
+            rows.append({
+                "id": (uuid_str(r["ZID"]) or "").lower(),
+                "title": r["ZTITLE"] or "", "body": r["ZBODY"] or "",
+                "isPinned": bool(r["ZISPINNED"]), "isArchived": bool(r["ZISARCHIVED"]),
+                "convertedAt": apple_time(r["ZCONVERTEDAT"]),
+                "convertedTargetName": r["ZCONVERTEDTARGETNAME"] or "",
+                "updated": apple_time(r["ZUPDATEDAT"]),
+            })
+    return sorted(rows, key=lambda r: (not r["isPinned"], -(r["updated"] or EPOCH).timestamp()))
+
+
+def _find(rows, needle, kind, haystack):
+    try:
+        wanted = str(uuid.UUID(needle)).lower()
+        for row in rows:
+            if row["id"] == wanted:
+                return row
+        die(f"no {kind} with id {needle}")
+    except ValueError:
+        pass
+    matches = [r for r in rows if needle.lower() in haystack(r).lower()]
+    if not matches:
+        die(f'no active {kind} matching "{needle}"')
+    if len(matches) > 1:
+        print(f'wf: "{needle}" matched {len(matches)} {kind}s, using the most recent:', file=sys.stderr)
+        for row in matches[:5]:
+            print(f"      {row['title']}", file=sys.stderr)
+    return matches[0]
+
+
+def find_task(needle):
+    """A UUID matches exactly; anything else matches a title fragment."""
+    return _find(all_tasks(), needle, "task", lambda r: r["title"])
+
+
+def find_note(needle):
+    return _find(all_notes(), needle, "note", lambda r: r["title"] + " " + r["body"])
+
+
+def note_title(row):
+    """Mirrors PMNote.displayTitle: fall back to the first body line."""
+    title = (row["title"] or "").strip()
+    if title:
+        return title
+    for line in (row["body"] or "").splitlines():
+        if line.strip():
+            return line.strip()[:60]
+    return "Untitled note"
+
+
+def local(dt):
+    return dt.astimezone() if dt else None
+
+
+# ------------------------------------------------------------------ writing
+
+def send(op, wait=True, **fields):
+    if not INBOX.exists():
+        die(f"inbox not found at {INBOX}\n"
+            "     Turn on WorkFlow > Settings > Agent Bridge.")
+    command = {"id": f"wf-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}", "op": op}
+    command.update({k: v for k, v in fields.items() if v is not None})
+
+    # Atomic: the app skips a half-written file for 5s, then calls it malformed.
+    tmp = INBOX / f".{command['id']}.tmp"
+    tmp.write_text(json.dumps(command, indent=2))
+    tmp.rename(INBOX / f"{command['id']}.json")
+
+    if not wait:
+        print(command["id"])
+        return None
+
+    receipt_path = OUTBOX / f"{command['id']}.json"
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if receipt_path.exists():
+            try:
+                receipt = json.loads(receipt_path.read_text())
+            except ValueError:
+                time.sleep(0.2)
+                continue
+            status = receipt.get("status", "?")
+            message = receipt.get("message", "")
+            marker = "ok" if status == "applied" else status
+            print(f"[{marker}] {message}")
+            if receipt.get("taskID"):
+                print(f"       task {receipt['taskID']}")
+            if status != "applied":
+                sys.exit(2)
+            wait_for_snapshot(after=receipt_path.stat().st_mtime)
+            return receipt
+        time.sleep(0.25)
+    die("timed out after 30s — is WorkFlow running with the bridge switched on?", 3)
+
+
+def wait_for_snapshot(after, timeout=6.0):
+    """Read-your-writes. The app rewrites snapshot.json about two seconds after
+    it applies a command, so a read straight after a write would see the old
+    world — `wf add X && wf attach X` failed on exactly that. Block until the
+    snapshot is newer than the receipt, or give up quietly and let the reader
+    take its chances."""
+    if not SNAPSHOT.exists():
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if SNAPSHOT.stat().st_mtime > after:
+                return
+        except OSError:
+            return
+        time.sleep(0.2)
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_state(args):
+    state = read_state()
+    if not state:
+        print(f"Bridge has never been enabled (no {STATE}).")
+    else:
+        print(f"enabled     {state.get('enabled')}")
+        print(f"app         {state.get('appVersion')} ({state.get('build')})")
+        print(f"folder      {state.get('root')}"
+              f"{'' if state.get('folderChosen') else '   (inside the app — choose a Bridge Folder to run unattended)'}")
+        print(f"last action {state.get('lastActivityAt', '—')}")
+        print(f"ops         {', '.join(state.get('ops', []))}")
+    snap = load_snapshot()
+    if snap:
+        generated = parse_iso(snap.get("generatedAt")) or datetime.now(timezone.utc)
+        age = int((datetime.now(timezone.utc) - generated).total_seconds())
+        print(f"snapshot    {len(snap.get('tasks', []))} tasks, {len(snap.get('notes', []))} notes, {age}s old")
+    else:
+        print("snapshot    none — reads fall back to the store (interactive only)")
+
+
+def cmd_tasks(args):
+    rows = all_tasks(include_hidden=args.all)
+    if not rows:
+        print("No tasks.")
+        return
+    for row in rows:
+        bits = [f"{(row['status'] or '?'):<12}", f"{row['title'][:46]:<46}"]
+        if row["project"]:
+            bits.append(f"[{row['project']}]")
+        if row["due"]:
+            bits.append(local(row["due"]).strftime("due %Y-%m-%d"))
+        print("  ".join(bits))
+        print(f"    {row['id']}")
+
+
+def print_thread(comments):
+    if not comments:
+        print("\nNo comments.")
+        return
+    print(f"\n{len(comments)} comment(s):")
+    for c in comments:
+        stamp = local(c["ts"]).strftime("%Y-%m-%d %H:%M") if c["ts"] else "?"
+        print(f"\n  {c['author']} · {stamp}")
+        for line in (c["text"] or "").splitlines() or [""]:
+            print(f"    {line}")
+
+
+def cmd_show(args):
+    task = find_task(args.task)
+    print(f"{task['title']}  ({task['status']})")
+    print(f"id {task['id']}")
+    if task["pinnedNote"]:
+        print(f"status: {task['pinnedNote']}")
+    for item in task["subtasks"]:
+        print(f"  [{'x' if item.get('isCompleted') else ' '}] {item.get('title', '')}")
+    print_thread(task["comments"])
+
+
+def cmd_queue(args):
+    """The agent's inbox: tasks whose assignee is the agent — the app's own
+    ownership field, so you assign from the phone exactly as you'd assign to
+    a person, and My Work already renders the mirror image."""
+    rows = [r for r in all_tasks()
+            if r["assignee"].lower() == AGENT_NAME.lower() and r["status"] != "Completed"]
+    rows.sort(key=lambda r: r["due"] or datetime.max.replace(tzinfo=timezone.utc))
+    if not rows:
+        print(f"Nothing assigned to {AGENT_NAME}.")
+        sys.exit(1)
+    for row in rows:
+        head = f"{row['title']}  [{row['status']}"
+        if row["priority"]:
+            head += f", {row['priority']}"
+        head += "]"
+        if row["due"]:
+            head += f"  due {local(row['due']):%Y-%m-%d}"
+        print(head)
+        print(f"  {row['id']}")
+        if row["pinnedNote"]:
+            print(f"  status: {row['pinnedNote']}")
+        for item in row["subtasks"]:
+            print(f"    [{'x' if item.get('isCompleted') else ' '}] {item.get('title', '')}")
+        if row["comments"]:
+            last = row["comments"][-1]
+            print(f"  last: {last['author']} — {(last['text'] or '')[:90]}")
+        print()
+    sys.exit(0)
+
+
+def cmd_poll(args):
+    """Comments the user has left since the last poll. Cheap by design: one
+    read on the ticks where nothing happened, and an exit code (1 = nothing)
+    a loop can branch on."""
+    since = args.since
+    if since is None and WATERMARK.exists():
+        since = WATERMARK.read_text().strip() or None
+    cutoff = parse_iso(since) if since else None
+    if since and cutoff is None:
+        die(f"couldn't read --since {since!r}; expected ISO-8601")
+    cutoff = cutoff or EPOCH
+
+    found, newest = [], cutoff
+    for row in all_tasks():
+        for c in row["comments"]:
+            ts = c["ts"]
+            if not ts:
+                continue
+            if ts > newest:
+                newest = ts
+            if ts <= cutoff or c["authorID"] == AGENT_AUTHOR_ID:
+                continue
+            found.append((ts, row, c))
+
+    for ts, row, c in sorted(found, key=lambda item: item[0]):
+        print(f"{row['title']}  ·  {c['author']}  ·  {local(ts):%Y-%m-%d %H:%M}")
+        print(f"  {c['text']}")
+        print(f"  reply: wf comment {row['id']} '...'")
+        print()
+
+    if not found:
+        print("Nothing new.")
+    if newest > cutoff:
+        BRIDGE.mkdir(parents=True, exist_ok=True)
+        WATERMARK.write_text(newest.isoformat())
+    sys.exit(0 if found else 1)
+
+
+def cmd_check(args):
+    task = find_task(args.task)
+    key = "uncheckSubtasks" if args.uncheck else "checkSubtasks"
+    send("update_task", **{"taskID": task["id"], key: args.subtask})
+
+
+def cmd_rename(args):
+    task = find_task(args.task)
+    send("update_task", taskID=task["id"], renameSubtasks=[{"from": args.old, "to": args.new}])
+
+
+def cmd_status(args):
+    task = find_task(args.task)
+    send("update_task", taskID=task["id"], pinnedNote=args.text)
+
+
+def cmd_setup(args):
+    """Stands up the agent's workspace: the project, its standing tasks, and
+    the smart list that surfaces them on every device."""
+    if not WORKSPACE_PACK.exists():
+        die(f"workspace pack missing at {WORKSPACE_PACK}")
+    pack = json.loads(WORKSPACE_PACK.read_text())
+    send("install_pack", pack=pack, createProjects=True, skipExistingProjects=True)
+    send("create_smart_list", name=AGENT_NAME, icon="sparkles", colorHex="#0F6B6B",
+         filters={"assignee": AGENT_NAME, "sort": "Due Date"})
+    print(f"\nOpen WorkFlow → Projects → Smart Lists → {AGENT_NAME}.")
+    print(f"Assign any task to \"{AGENT_NAME}\" and it lands in `wf queue`.")
+
+
+def cmd_notes(args):
+    rows = all_notes(include_archived=args.all)
+    if not rows:
+        print("Notepad is empty.")
+        sys.exit(1)
+    for row in rows:
+        flags = []
+        if row["isPinned"]:
+            flags.append("pinned")
+        if row["convertedAt"]:
+            flags.append(f"-> {row['convertedTargetName']}")
+        body = (row["body"] or "").strip().replace("\n", " ")
+        marker = "*" if NOTE_MARKER in (row["title"] + body).lower() else " "
+        head = f"{marker} {note_title(row)}"
+        if flags:
+            head += f"  ({', '.join(flags)})"
+        print(head)
+        if body:
+            print(f"    {body[:96]}")
+        print(f"    {row['id']}")
+    print(f"\n* = marked {NOTE_MARKER}")
+    sys.exit(0)
+
+
+def cmd_note(args):
+    row = find_note(args.note)
+    print(note_title(row))
+    print(f"id {row['id']}")
+    if row["convertedAt"]:
+        print(f"converted -> {row['convertedTargetName']}")
+    print()
+    print(row["body"] or "(empty)")
+
+
+def cmd_jot(args):
+    send("create_note", title=args.title, notes=args.body,
+         colorHex=args.color, isPinned=args.pin or None)
+
+
+def cmd_convert(args):
+    row = find_note(args.note)
+    send("convert_note", noteID=row["id"], project=args.project,
+         title=args.title, priority=args.priority, dueDate=args.due,
+         assignee=args.assignee, subtasks=args.subtask or None)
+
+
+def cmd_attach(args):
+    """Stage the file inside the bridge folder, then ask the app to take it.
+
+    The app is sandboxed and can only open files inside its own container or
+    the chosen bridge folder, so a file anywhere else has to be copied in
+    first. The app deletes the staged copy once the bytes are in the store.
+    """
+    import shutil
+    src = Path(args.file).expanduser()
+    if not src.is_file():
+        die(f"no such file: {src}")
+    task = find_task(args.task)
+    ATTACHMENTS.mkdir(parents=True, exist_ok=True)
+    staged = ATTACHMENTS / src.name
+    # A source already inside attachments/ is fine — just use it.
+    if Path(src).resolve() != staged.resolve():
+        shutil.copyfile(src, staged)
+    send("attach_file", taskID=task["id"], fileName=src.name, displayName=args.name)
+
+
+def cmd_reply(args):
+    """Answer a note *in the note*. Notes have no comment thread, so the reply
+    is appended to the body — signed and dated, never overwriting a word of
+    what was there — which is what shows up in the Notepad on the phone."""
+    row = find_note(args.note)
+    send("update_note", noteID=row["id"], appendText=args.text,
+         isPinned=args.pin or None)
+
+
+# ------------------------------------------------------------------ sweep
+
+INDEX_TASK = "Sprint and Updates"
+SWEEP_STATE = BRIDGE / "sweep-state.json"
+PORTFOLIO_PROJECT = "Opticell"
+PORTFOLIO_TAG = "portfolio"
+SELLER = "opticell"
+
+
+def _app_names_from_index():
+    """The index task's checklist is the source of truth for which apps exist.
+    Each subtask reads "Name — version (source)"; the name is what's before
+    the dash."""
+    idx = _find(all_tasks(include_hidden=True), INDEX_TASK, "task", lambda r: r["title"])
+    names = []
+    for item in idx["subtasks"]:
+        title = item.get("title", "")
+        name = title.split(" — ")[0].split(" – ")[0].strip()
+        if name:
+            names.append((name, title))
+    return idx, names
+
+
+def _match_app(text, names):
+    """Longest app name mentioned in the text wins, so 'myllm android' beats
+    'myllm'. Case-insensitive; punctuation in names is tolerated."""
+    low = text.lower()
+    best, best_len = None, 0
+    for name, _ in names:
+        key = name.lower().replace(".stl", "").strip()
+        variants = {key, key.replace(" - ", " "), key.replace("-", " "), key.replace(" ", "")}
+        for v in variants:
+            if v and v in low.replace("-", " ") and len(v) > best_len:
+                best, best_len = name, len(v)
+    return best
+
+
+def _store_versions():
+    """Live App Store versions for everything this seller publishes, iOS and
+    Mac, keyed by lower-cased track name. Empty on any network failure — the
+    sweep must still run offline."""
+    import urllib.request
+    out = {}
+    for entity in ("software", "macSoftware"):
+        url = f"https://itunes.apple.com/search?term={SELLER}&entity={entity}&limit=50&country=gb"
+        try:
+            with urllib.request.urlopen(url, timeout=15) as r:
+                data = json.load(r)
+        except Exception:
+            continue
+        for r in data.get("results", []):
+            if SELLER in (r.get("sellerName") or "").lower():
+                out[r["trackName"].lower()] = (r.get("version"), (r.get("currentVersionReleaseDate") or "")[:10], entity)
+    return out
+
+
+def _version_for(name, store):
+    """Match a checklist name to a store track name by word overlap, preferring
+    the most specific track: 'Drawpad Pro' must land on 'DrawPad Pro.stl', not
+    'DrawPad' (which shares the first word and came first in the dict).
+    Android rows never match — the App Store has no Android builds."""
+    if "android" in name.lower():
+        return None
+    def words(t):
+        t = t.lower().replace(".stl", "").replace("—", " ").replace("-", " ").replace(":", " ")
+        return [w for w in t.split() if w]
+    key = words(name)
+    if not key:
+        return None
+    best, best_score = None, 0.0
+    for track, v in store.items():
+        tw = words(track)
+        matched = sum(1 for w in key if w in tw)
+        if matched == 0:
+            continue
+        # every key word should be present for a multi-word key; otherwise
+        # it's a weak first-word hit and a longer track name must not win it
+        if matched < len(key) and len(key) > 1:
+            continue
+        score = matched - 0.01 * (len(tw) - matched)
+        if score > best_score:
+            best, best_score = v, score
+    return best
+
+
+def _load_sweep_state():
+    try:
+        return json.loads(SWEEP_STATE.read_text())
+    except (OSError, ValueError):
+        return {"filedNotes": {}}
+
+
+def cmd_sweep(args):
+    if getattr(args, "action", None) in ("install", "status", "uninstall"):
+        return sweep_launchd(args)
+
+    idx, names = _app_names_from_index()
+    state = _load_sweep_state()
+    store = _store_versions()
+
+    # 1. versions: what the checklist says vs what the store says now
+    drift = []
+    for name, title in names:
+        live = _version_for(name, store)
+        if not live:
+            continue
+        shown = title.split(" — ", 1)[1] if " — " in title else ""
+        if live[0] and live[0] not in shown:
+            drift.append((name, live[0], live[1], title))
+
+    # 2. notes: unarchived, unconverted, mentioning an app, not yet filed
+    filed = state["filedNotes"]
+    matched, unmatched = [], []
+    for n in all_notes():
+        if n["convertedAt"] or n["id"] in filed:
+            continue
+        app = _match_app(n["title"] + " " + n["body"], names)
+        (matched if app else unmatched).append((app, n))
+
+    # 3. open per-app fix lists
+    open_lists = [t for t in all_tasks() if t["title"].endswith(" — updates & fixes") and t["status"] != "Completed"]
+
+    if args.json:
+        print(json.dumps({
+            "apps": [n for n, _ in names],
+            "versionDrift": [{"app": a, "live": v, "released": d, "checklist": t} for a, v, d, t in drift],
+            "notes": [{"app": a, "id": n["id"], "title": note_title(n), "body": n["body"]} for a, n in matched],
+            "unmatchedNotes": [{"id": n["id"], "title": note_title(n), "body": n["body"][:200]} for _, n in unmatched],
+            "openLists": [{"task": t["title"], "id": t["id"],
+                           "open": [i["title"] for i in t["subtasks"] if not i.get("isCompleted")]} for t in open_lists],
+        }, indent=2))
+    else:
+        print(f"PORTFOLIO SWEEP — {len(names)} apps on the index")
+        print("\nVersion drift (store newer than the checklist):")
+        for a, v, d, _ in drift or []:
+            print(f"  {a:24} store {v} ({d})")
+        if not drift:
+            print("  none — checklist matches the App Store" if store else "  (App Store unreachable; skipped)")
+        print(f"\nNotes to file ({len(matched)}):")
+        for a, n in matched:
+            print(f"  [{a}] {note_title(n)}  ·  {n['id']}")
+        if not matched:
+            print("  none")
+        if unmatched:
+            print(f"\nNotes mentioning no app ({len(unmatched)}) — left alone:")
+            for _, n in unmatched:
+                print(f"  {note_title(n)}  ·  {n['id']}")
+        print(f"\nOpen fix lists ({len(open_lists)}):")
+        for t in open_lists:
+            pending = [i for i in t["subtasks"] if not i.get("isCompleted")]
+            print(f"  {t['title']:40} {len(pending)} open")
+        if not open_lists:
+            print("  none yet — created on first filing")
+
+    if not args.apply:
+        return
+
+    # ---- apply: file each matched note under its app's list -------------
+    ops_supported = set(read_state().get("ops", []))
+    can_reply = "update_note" in ops_supported
+    for app, n in matched:
+        list_title = f"{app} — updates & fixes"
+        existing = next((t for t in all_tasks() if t["title"] == list_title), None)
+        line = note_title(n)[:120]
+        if existing:
+            send("update_task", taskID=existing["id"], addSubtasks=[line])
+        else:
+            ver = _version_for(app, store)
+            send("create_task", title=list_title, project=PORTFOLIO_PROJECT, tags=[PORTFOLIO_TAG],
+                 priority="Medium", dueDate="2027-09-01",
+                 pinnedNote=f"Live: {ver[0]}" if ver else "",
+                 notes=f"Updates and bug fixes for {app}. Filed by the weekly sweep from Notepad notes that mention the app; each subtask is one note. The due date is parked a year out — this is a standing list, not a deadline.",
+                 subtasks=[line])
+        if can_reply:
+            send("update_note", noteID=n["id"], appendText=f"Filed under “{list_title}”.")
+        filed[n["id"]] = {"app": app, "at": datetime.now(timezone.utc).isoformat()}
+    # versions: refresh the index checklist in place (replace, so re-read first)
+    if drift:
+        idx, names = _app_names_from_index()
+        new_titles = []
+        for name, title in names:
+            hit = next((d for d in drift if d[0] == name), None)
+            if hit:
+                _, v, date, _ = hit
+                src = "Mac App Store" if (_version_for(name, store) or ("", "", ""))[2] == "macSoftware" else "App Store"
+                # Same shape as the hand-written lines: "29 Aug", not ISO.
+                try:
+                    nice = datetime.strptime(date, "%Y-%m-%d").strftime("%-d %b")
+                except ValueError:
+                    nice = date
+                new_titles.append(f"{name} — {v}  ({src}, {nice})")
+            else:
+                new_titles.append(title)
+        send("update_task", taskID=idx["id"], subtasks=new_titles,
+             pinnedNote=f"Versions refreshed by the sweep {datetime.now():%-d %b}. {len(names)} apps.")
+    SWEEP_STATE.write_text(json.dumps(state, indent=2))
+    print(f"\napplied: {len(matched)} note(s) filed, {len(drift)} version(s) refreshed")
+
+
+SWEEP_LABEL = "app.workflow.claude-sweep"
+SWEEP_PLIST = Path.home() / "Library/LaunchAgents" / f"{SWEEP_LABEL}.plist"
+SWEEP_SCRIPT = HERE / "claude-sweep.sh"
+
+
+def sweep_launchd(args):
+    if args.action == "status":
+        print(f"launchd agent   {'installed' if SWEEP_PLIST.exists() else 'not installed'}")
+        if SWEEP_PLIST.exists():
+            out = os.popen(f"launchctl list 2>/dev/null | grep {SWEEP_LABEL}").read().strip()
+            print(f"loaded          {out or 'no'}")
+            print(f"schedule        {args.day if hasattr(args,'day') else 'see plist'}")
+        print(f"last sweep      {_load_sweep_state().get('lastRun', 'never')}")
+        return
+    if args.action == "uninstall":
+        os.system(f"launchctl bootout gui/$(id -u)/{SWEEP_LABEL} 2>/dev/null")
+        if SWEEP_PLIST.exists():
+            SWEEP_PLIST.unlink()
+        print("Weekly sweep removed.")
+        return
+    # install — shares wake.config (bridge folder, claude binary, work dir)
+    if not WAKE_CONFIG.exists():
+        die("run `wf wake install` first — the sweep shares its config (bridge folder, claude path).")
+    days = {"mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6, "sun": 0}
+    day = days.get((args.day or "mon").lower()[:3])
+    if day is None:
+        die("--day must be mon..sun")
+    hour, minute = (args.at or "09:00").split(":")
+    log_file = str(Path.home() / "Library/Logs/claude-sweep.log")
+    plist = {
+        "Label": SWEEP_LABEL,
+        "ProgramArguments": ["/bin/bash", str(SWEEP_SCRIPT)],
+        "StartCalendarInterval": {"Weekday": day, "Hour": int(hour), "Minute": int(minute)},
+        "RunAtLoad": False,
+        "StandardErrorPath": log_file,
+    }
+    SWEEP_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    with open(SWEEP_PLIST, "wb") as fh:
+        plistlib.dump(plist, fh)
+    os.system(f"launchctl bootout gui/$(id -u)/{SWEEP_LABEL} 2>/dev/null")
+    rc = os.system(f"launchctl bootstrap gui/$(id -u) {SWEEP_PLIST} 2>/dev/null")
+    print(f"installed  {SWEEP_PLIST}")
+    print(f"runs       every {(args.day or 'mon').title()} at {args.at or '09:00'} — a session that sweeps notes, refreshes versions, updates the index")
+    print(f"log        {log_file}")
+    if rc != 0:
+        print("launchctl bootstrap reported a problem — check: wf sweep status")
+
+
+def cmd_ping(args):
+    send("ping")
+
+
+def cmd_comment(args):
+    task = find_task(args.task)
+    send("add_comment", taskID=task["id"], text=args.text, mentions=args.mention or None)
+
+
+def cmd_add(args):
+    send("create_task", title=args.title, project=args.project, notes=args.notes,
+         dueDate=args.due, priority=args.priority, status=args.status,
+         assignee=args.assignee, pinnedNote=args.status_note,
+         tags=args.tag or None, subtasks=args.subtask or None, text=args.comment)
+
+
+def cmd_done(args):
+    task = find_task(args.task)
+    send("complete_task", taskID=task["id"])
+
+
+def cmd_project(args):
+    send("create_project", name=args.name, icon=args.icon,
+         colorHex=args.color, projectDescription=args.description)
+
+
+def cmd_pack(args):
+    try:
+        pack = json.loads(Path(args.file).read_text())
+    except (OSError, ValueError) as exc:
+        die(f"couldn't read {args.file}: {exc}")
+    send("install_pack", pack=pack, createProjects=not args.library_only,
+         skipExistingProjects=args.skip_existing)
+
+
+# --------------------------------------------------------------- session
+
+SESSIONS_PROJECT = "Claude Sessions"
+SESSIONS_HANDS_OFF = ("Claude-maintained session log. The owner does not edit, tick, move or "
+                      "delete anything in this project unless Claude specifically asks.")
+# Working-folder name -> task title, for folders that share a codebase task.
+SESSION_ALIASES = {
+    "rally - android": "Rally",
+    "linkr - android": "Linkr",
+}
+HOUSEKEEPING_TITLE = "Claude — housekeeping"
+# Whose desk the handoffs land on. Written for one person; set WF_OWNER and
+# WF_OWNER_PROJECT to make it yours (the default is the Mac account name).
+OWNER = os.environ.get("WF_OWNER") or getpass.getuser().title()
+HANDOFF_TAG = "needs-" + OWNER.lower().replace(" ", "-")
+HANDOFF_LIST = "Needs " + OWNER
+HANDOFF_PROJECT = os.environ.get("WF_OWNER_PROJECT", "Opticell")   # where "<App> — updates & fixes" already live
+JOB_TEMPLATES = {
+    "release-ios": [
+        "Bump MARKETING_VERSION and CURRENT_PROJECT_VERSION",
+        "Update WhatsNew highlights for this version",
+        "Write RELEASE_NOTES_<version>.md",
+        "Build green in Xcode (SourceKit noise doesn't count)",
+        "Archive and upload to App Store Connect",
+        "Listing copy and screenshots checked",
+        "Submit for review",
+        "Log the outcome with wf session --log",
+    ],
+    "release-mac": [
+        "Bump MARKETING_VERSION and CURRENT_PROJECT_VERSION (Mac build number)",
+        "Update WhatsNew highlights (macOnly flag if Mac-only)",
+        "Write or extend RELEASE_NOTES_<version>.md",
+        "Build green for the Mac target",
+        "Archive Mac and upload to App Store Connect",
+        "Mac listing copy checked",
+        "Submit for review",
+        "Log the outcome with wf session --log",
+    ],
+    "release-android": [
+        "JAVA_HOME -> Android Studio JBR",
+        "Run the pin scripts before bumping (pin_jsdelivr / pin_android where they exist)",
+        "Bump versionName and versionCode",
+        "Build the signed AAB (bundleRelease), not the stale one in build.nosync",
+        "Emulator verification",
+        "Upload to Play Console with release notes",
+        "Two commits, --no-gpg-sign",
+        "Log the outcome with wf session --log",
+    ],
+}
+
+
+def _housekeeping():
+    t = _session_task(HOUSEKEEPING_TITLE)
+    if t is None:
+        die(f"no “{HOUSEKEEPING_TITLE}” task in {SESSIONS_PROJECT}")
+    return t
+
+
+def _stage_and_attach(task, path):
+    """Copy a file into the bridge's attachments/ and hand it to the app.
+    Returns the display name used."""
+    import shutil
+    src = Path(path).expanduser()
+    if not src.is_file():
+        die(f"no such file: {src}")
+    ATTACHMENTS.mkdir(parents=True, exist_ok=True)
+    staged = ATTACHMENTS / src.name
+    if src.resolve() != staged.resolve():
+        shutil.copyfile(src, staged)
+    send("attach_file", taskID=task["id"], fileName=src.name)
+    return src
+
+
+def _week_sessions(days=7):
+    """Sessions active in the last N days, by working folder, from the
+    transcripts under ~/.claude/projects. Symlinked project dirs (Developer/
+    WorkFlow -> Desktop/WorkFlow) are deduped on the resolved path."""
+    root = Path.home() / ".claude/projects"
+    cutoff = time.time() - days * 86400
+    seen, counts = set(), {}
+    for d in root.iterdir():
+        if not d.is_dir():
+            continue
+        real = d.resolve()
+        if real in seen:
+            continue
+        seen.add(real)
+        name = d.name
+        for prefix in ("-Users-alex-Desktop-", "-Users-alex-Developer-", "-Users-alex-Projects-", "-Users-alex-"):
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+                break
+        if name == "-Users-alex-Desktop":
+            name = "Desktop"
+        name = name.replace("---", " - ").replace("-", " ") or "Desktop"
+        n = sum(1 for f in d.glob("*.jsonl") if f.stat().st_mtime >= cutoff)
+        if n:
+            counts[name] = counts.get(name, 0) + n
+    # Prefer the exact title of an existing session task where one matches.
+    titles = {r["title"].lower().replace("-", " "): r["title"] for r in _session_rows()}
+    return {titles.get(k.lower(), k): v for k, v in counts.items()}
+
+
+
+def _session_name(explicit):
+    """The task title for a working folder. Path.cwd() resolves symlinks, so
+    ~/Desktop/WorkFlow -> ~/Developer/WorkFlow both give "WorkFlow"."""
+    name = (explicit or Path.cwd().name).strip()
+    return SESSION_ALIASES.get(name.lower(), name)
+
+
+def _session_rows():
+    return [r for r in all_tasks(include_hidden=True)
+            if (r["project"] or "").lower() == SESSIONS_PROJECT.lower()]
+
+
+def _session_task(title):
+    for r in _session_rows():
+        if r["title"].lower() == title.lower():
+            return r
+    return None
+
+
+def cmd_session(args):
+    if args.list:
+        rows = sorted(_session_rows(), key=lambda r: r["title"].lower())
+        if not rows:
+            print(f"No tasks in {SESSIONS_PROJECT}.")
+            return
+        for r in rows:
+            last = r["comments"][-1]["ts"] if r["comments"] else None
+            stamp = local(last).strftime("%Y-%m-%d") if last else "never"
+            print(f"{r['title']:<22} last session {stamp}  ·  {r['pinnedNote'][:90]}")
+        return
+
+    if args.weekly:
+        counts = _week_sessions()
+        total = sum(counts.values())
+        parts = ", ".join(f"{k} {v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
+        line = (f"Week to {datetime.now():%-d %b %Y}: {total} session(s) active — {parts}."
+                if total else f"Week to {datetime.now():%-d %b %Y}: no sessions.")
+        print(line)
+        send("add_comment", taskID=_housekeeping()["id"], text=line)
+        return
+
+    title = _session_name(args.codebase)
+    writing = any([args.log, args.state, args.open, args.close, args.attach])
+    task = _session_task(title)
+
+    if task is None:
+        if not writing:
+            print(f"No session log for “{title}” yet in {SESSIONS_PROJECT}.\n"
+                  f"Start one with: wf session {title!r} --log \"...\" [--state \"...\"]")
+            return
+        send("create_task", title=title, project=SESSIONS_PROJECT,
+             notes=SESSIONS_HANDS_OFF, tags=["claude-log"],
+             pinnedNote=args.state or f"First session {datetime.now():%Y-%m-%d}. No state written yet.",
+             subtasks=args.open or None,
+             text=args.log)
+        return
+
+    if not writing:
+        print(f"{task['title']}  ·  {SESSIONS_PROJECT}")
+        print(f"state: {task['pinnedNote'] or '(none)'}")
+        if task["notes"] and task["notes"] != SESSIONS_HANDS_OFF:
+            print()
+            for line in task["notes"].splitlines():
+                print(f"  {line}")
+        open_loops = [i for i in task["subtasks"] if not i.get("isCompleted")]
+        if open_loops:
+            print("\nopen loops:")
+            for i in open_loops:
+                print(f"  [ ] {i.get('title', '')}")
+        comments = task["comments"] if args.all else task["comments"][-3:]
+        if comments and not args.all and len(task["comments"]) > 3:
+            print(f"\n(last 3 of {len(task['comments'])} sessions — --all for the rest)")
+        print_thread(comments)
+        return
+
+    fields = {}
+    if args.state:
+        fields["pinnedNote"] = args.state
+    if args.open:
+        fields["addSubtasks"] = args.open
+    if args.close:
+        fields["checkSubtasks"] = args.close
+    if fields:
+        send("update_task", taskID=task["id"], **fields)
+
+    # Evidence: the file goes on the task (this one, or --to another), and the
+    # comment says what it is and where the original lives, so it can be found
+    # again without knowing the folder.
+    attached = []
+    if args.attach:
+        target = find_task(args.to) if args.to else task
+        for path in args.attach:
+            src = _stage_and_attach(target, path)
+            attached.append(f"{src.name}  (from {src})")
+    text = args.log or ""
+    if attached:
+        where = f" on “{args.to}”" if args.to else ""
+        text = (text + "\n\n" if text else "") + f"Attached{where}:\n" + "\n".join(f"• {a}" for a in attached)
+    if text:
+        send("add_comment", taskID=task["id"], text=text)
+
+
+def cmd_handoff(args):
+    """A task the owner has to do themselves — an auth-gated command, a console
+    click. Tagged so the "Needs <owner>" smart list shows every open one."""
+    notes = args.notes or ""
+    if args.command:
+        notes = (notes + "\n\n" if notes else "") + "Run:\n" + "\n".join(args.command)
+    send("create_smart_list", name=HANDOFF_LIST, icon="hand.raised",
+         colorHex="#B85C38", filters={"tag": HANDOFF_TAG, "status": "To Do", "sort": "Due Date"})
+    send("create_task", title=args.title, project=args.project, notes=notes or None,
+         priority=args.priority, dueDate=args.due, assignee=OWNER,
+         tags=[HANDOFF_TAG], text=args.why)
+
+
+def cmd_job(args):
+    """A checklist for one long job (a release, an upload). Claude ticks steps
+    with `wf check` as it goes, so progress is visible on the phone."""
+    steps = list(JOB_TEMPLATES.get(args.template, [])) if args.template else []
+    steps += args.step or []
+    if not steps:
+        die("no steps — pass --template " + "|".join(JOB_TEMPLATES) + " and/or --step")
+    send("create_task", title=args.title, project=SESSIONS_PROJECT, tags=["claude-log", "job"],
+         status="In Progress", priority="Medium", notes=SESSIONS_HANDS_OFF,
+         pinnedNote=f"Started {datetime.now():%-d %b %Y %H:%M}. 0 of {len(steps)} steps.",
+         subtasks=steps, text=args.why)
+
+
+# ------------------------------------------------------------------ wake
+
+LAUNCH_LABEL = "app.workflow.claude-wake"
+PLIST_PATH = Path.home() / "Library/LaunchAgents" / f"{LAUNCH_LABEL}.plist"
+WAKE_SCRIPT = HERE / "claude-wake.sh"
+WAKE_CONFIG = HERE / "wake.config"
+SEEN_FILE = HERE / ".wake-seen"
+PROTECTED = ("Desktop", "Documents", "Downloads")
+
+
+def under_protected(path):
+    """macOS keeps background processes out of these without a grant."""
+    resolved = Path(path).resolve()
+    return any(resolved.is_relative_to(Path.home() / name) for name in PROTECTED)
+
+
+def cmd_wake(args):
+    if args.action == "status":
+        return wake_status()
+    if args.action == "uninstall":
+        return wake_uninstall()
+    return wake_install(args)
+
+
+def wake_status():
+    state = read_state()
+    print(f"launchd agent   {'installed' if PLIST_PATH.exists() else 'not installed'}")
+    if PLIST_PATH.exists():
+        out = os.popen(f"launchctl list 2>/dev/null | grep {LAUNCH_LABEL}").read().strip()
+        print(f"loaded          {out if out else 'no (run: wf wake install)'}")
+    print(f"config          {'present' if WAKE_CONFIG.exists() else 'missing'}")
+    print(f"bridge folder   {state.get('root', '-')}"
+          f"{'' if state.get('folderChosen') else '   !! inside the app: a launchd session cannot reach it'}")
+    print(f"workspace       \"{state.get('workspaceProject', '-')}\" project, unshared only")
+    latest = Path(state["wakeDir"]) / "latest.json" if state.get("wakeDir") else None
+    if latest and latest.exists():
+        data = json.loads(latest.read_text())
+        seen = SEEN_FILE.read_text().strip() if SEEN_FILE.exists() else "0"
+        print(f"last signal     #{data.get('sequence')} at {data.get('generatedAt')}"
+              f" ({len(data.get('tasks', []))} task(s)); handled #{seen}")
+    else:
+        print("last signal     none yet")
+
+
+def wake_install(args):
+    state = read_state()
+    wake_dir = state.get("wakeDir")
+    if not wake_dir:
+        die("bridge hasn't run yet - turn on WorkFlow > Settings > Agent Bridge first")
+    if not state.get("folderChosen"):
+        die("the bridge is still inside the app's container, which a launchd session "
+            "cannot reach.\n     In WorkFlow: Settings > Agent Bridge > Bridge Folder, "
+            "pick a folder, then run this again.")
+    root = state.get("root")
+    if under_protected(root):
+        print("wf: warning — the bridge folder is under Desktop, Documents or Downloads, "
+              "which macOS protects from background processes. If the trigger never "
+              "fires, choose a folder elsewhere (e.g. ~/Developer).", file=sys.stderr)
+    if under_protected(HERE):
+        die("this tooling lives under Desktop, Documents or Downloads, which macOS keeps "
+            "away from background processes — launchd couldn't even read the script. "
+            "Move the repo (e.g. to ~/Developer) and run this again.")
+
+    # launchd starts the script with a bare PATH (/usr/bin:/bin:...), which
+    # knows nothing of ~/.local/bin, Homebrew or nvm — so `claude` was found
+    # at a stale /usr/local/bin symlink whose `#!/usr/bin/env node` then died
+    # with "env: node: No such file or directory". Resolve both the binary and
+    # the PATH from the user's *login* shell and bake them into the config;
+    # the scripts export that PATH before running anything.
+    login_path = os.popen("/bin/zsh -lic 'printf %s \"$PATH\"' 2>/dev/null").read().strip()
+    claude_bin = args.claude or os.popen(
+        "/bin/zsh -lic 'command -v claude' 2>/dev/null").read().strip().splitlines()[-1:]
+    claude_bin = claude_bin[0] if isinstance(claude_bin, list) and claude_bin else (claude_bin or "")
+    if not claude_bin:
+        die("couldn't find the `claude` binary; pass --claude /path/to/claude")
+    claude_bin = str(Path(claude_bin).expanduser())
+    work_dir = str(Path(args.dir or HERE.parents[1]).resolve())
+    log_file = str(Path.home() / "Library/Logs/claude-wake.log")
+
+    WAKE_CONFIG.write_text(
+        f'BRIDGE_ROOT="{root}"\n'
+        f'WAKE_DIR="{wake_dir}"\n'
+        f'WORK_DIR="{work_dir}"\n'
+        f'CLAUDE_BIN="{claude_bin}"\n'
+        f'LOG_FILE="{log_file}"\n'
+        f'WAKE_PATH="{login_path}"\n'
+        f'MODEL="{args.model or ""}"\n'
+    )
+
+    plist = {
+        "Label": LAUNCH_LABEL,
+        "ProgramArguments": ["/bin/bash", str(WAKE_SCRIPT)],
+        # Watch the directory, not the file inside it: a watch on a path that
+        # gets atomically replaced re-binds unreliably.
+        "WatchPaths": [wake_dir],
+        # Safety net for a missed FS event. The script exits in milliseconds
+        # when the sequence number says there is nothing new.
+        "StartInterval": 900,
+        "ThrottleInterval": 30,
+        "RunAtLoad": False,
+        "StandardErrorPath": log_file,
+    }
+    PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(PLIST_PATH, "wb") as fh:
+        plistlib.dump(plist, fh)
+
+    os.system(f"launchctl bootout gui/$(id -u)/{LAUNCH_LABEL} 2>/dev/null")
+    rc = os.system(f"launchctl bootstrap gui/$(id -u) {PLIST_PATH} 2>/dev/null")
+
+    # A backgrounded Catalyst app gets napped by macOS and stops processing the
+    # silent pushes that drive iCloud imports — the trigger then has nothing to
+    # see. This is Finder's "Prevent App Nap" checkbox, set from the shell; it
+    # takes effect at the app's next launch. 4.2.2 does the same from inside.
+    os.system('defaults write mac.TeamDZX.worflow NSAppSleepDisabled -bool YES')
+
+    print(f"installed  {PLIST_PATH}")
+    print(f"watching   {wake_dir}")
+    print("app nap    disabled for WorkFlow (takes effect at its next launch)")
+    print(f"runs       {claude_bin} in {work_dir}")
+    print(f"log        {log_file}")
+    if rc != 0:
+        print("\nlaunchctl bootstrap reported a problem - check with: wf wake status")
+    print(f"\nOnly tasks in the \"{state.get('workspaceProject', AGENT_NAME)}\" project, or notes")
+    print(f"marked {NOTE_MARKER}, can wake a session — and only while that project is unshared.")
+
+
+def wake_uninstall():
+    os.system(f"launchctl bootout gui/$(id -u)/{LAUNCH_LABEL} 2>/dev/null")
+    for path in (PLIST_PATH, WAKE_CONFIG, SEEN_FILE):
+        if path.exists():
+            path.unlink()
+    print("Wake trigger removed. The app still writes the signal; nothing listens now.")
+
+
+# ------------------------------------------------------------------ main
+
+# ---------------------------------------------------------------- mail (Tier 3)
+#
+# `wf mail` reads the UNREAD set of an iCloud inbox over IMAP so a scheduled
+# session (claude-mail.sh) can turn what needs doing into tasks. Read-only by
+# construction: the mailbox is SELECTed read-only and nothing is ever STOREd,
+# so no flag changes, no moves, no deletes — Mail on the phone won't even see
+# the messages as read. The only state kept is the list of message ids already
+# handled (`mail-state.json` in the bridge folder). The app-specific password
+# lives in the login Keychain, never in a file.
+
+MAIL_CONFIG = HERE / "mail.config"
+MAIL_STATE = BRIDGE / "mail-state.json"
+MAIL_LABEL = "app.workflow.claude-mail"
+MAIL_PLIST = Path.home() / "Library/LaunchAgents" / f"{MAIL_LABEL}.plist"
+MAIL_SCRIPT = HERE / "claude-mail.sh"
+MAIL_KEYCHAIN_SERVICE = "wf-mail"
+MAIL_PREVIEW_LIMIT = 700
+
+
+def _mail_config():
+    if not MAIL_CONFIG.exists():
+        die("mail isn't set up — run: wf mail setup you@icloud.com")
+    return json.loads(MAIL_CONFIG.read_text())
+
+
+def _mail_password(user):
+    import subprocess
+    r = subprocess.run(["security", "find-generic-password", "-s", MAIL_KEYCHAIN_SERVICE, "-a", user, "-w"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        die("no password in the Keychain for that address — run: wf mail setup " + user)
+    return r.stdout.strip()
+
+
+def _mail_state():
+    if MAIL_STATE.exists():
+        try:
+            return json.loads(MAIL_STATE.read_text())
+        except json.JSONDecodeError:
+            pass
+    return {"handled": {}}
+
+
+def _mail_save_state(state):
+    # Keep it bounded: ids older than 90 days are dropped; UNSEEN messages
+    # that old are a lost cause anyway.
+    cutoff = time.time() - 90 * 86400
+    state["handled"] = {k: v for k, v in state["handled"].items() if v >= cutoff}
+    MAIL_STATE.write_text(json.dumps(state, indent=2))
+
+
+def _decode_header(value):
+    from email.header import decode_header, make_header
+    try:
+        return str(make_header(decode_header(value or ""))).strip()
+    except Exception:
+        return (value or "").strip()
+
+
+def mail_parse(raw):
+    """One IMAP message (possibly truncated) → the fields a task needs.
+    Pure function: what claude-mail.sh gets, and what the tests cover."""
+    import email
+    from email import policy
+    from email.utils import parsedate_to_datetime
+    msg = email.message_from_bytes(raw, policy=policy.compat32)
+    subject = _decode_header(msg.get("Subject"))
+    sender = _decode_header(msg.get("From")).replace('"', "")
+    msg_id = (msg.get("Message-ID") or "").strip()
+    date = None
+    try:
+        date = parsedate_to_datetime(msg.get("Date")) if msg.get("Date") else None
+    except Exception:
+        date = None
+    preview, html = None, None
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    for part in parts:
+        ctype = part.get_content_type()
+        if ctype not in ("text/plain", "text/html"):
+            continue
+        try:
+            payload = part.get_payload(decode=True) or b""
+            charset = part.get_content_charset() or "utf-8"
+            text = payload.decode(charset, errors="replace")
+        except Exception:
+            continue
+        if ctype == "text/plain" and text.strip():
+            preview = text
+            break
+        if ctype == "text/html" and html is None:
+            import re as _re
+            t = _re.sub(r"(?is)<style.*?</style>", "", text)
+            t = _re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>|</tr>", "\n", t)
+            t = _re.sub(r"<[^>]+>", "", t)
+            html = (t.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<")
+                     .replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'"))
+    text = (preview or html or "")
+    import re as _re
+    text = _re.sub(r"\n{3,}", "\n\n", text.replace("\r\n", "\n")).strip()
+    if len(text) > MAIL_PREVIEW_LIMIT:
+        text = text[:MAIL_PREVIEW_LIMIT].rstrip() + "…"
+    link = None
+    if msg_id:
+        link = "message://%3C" + msg_id.strip("<>") + "%3E"
+    return {
+        "id": msg_id or f"nomsgid:{sender}|{subject}|{msg.get('Date','')}",
+        "subject": subject or "(no subject)",
+        "from": sender,
+        "date": date.isoformat(timespec="minutes") if date else None,
+        "link": link,
+        "preview": text,
+    }
+
+
+def mail_fetch_unread(limit=50):
+    import imaplib
+    cfg = _mail_config()
+    user = cfg["user"]
+    pw = _mail_password(user)
+    box = imaplib.IMAP4_SSL(cfg.get("host", "imap.mail.me.com"), 993)
+    try:
+        box.login(user, pw)
+        # readonly: the server never sets \Seen on FETCH, and STORE is refused.
+        status, _ = box.select("INBOX", readonly=True)
+        if status != "OK":
+            die("couldn't open INBOX")
+        status, data = box.search(None, "UNSEEN")
+        if status != "OK":
+            die("search failed")
+        uids = data[0].split()
+        uids = uids[-limit:] if limit else uids
+        out = []
+        for uid in uids:
+            # PEEK: read without touching flags. First 24 KB is plenty for
+            # headers and a preview; attachments never come down.
+            status, parts = box.fetch(uid, "(BODY.PEEK[]<0.24576>)")
+            if status != "OK" or not parts or not isinstance(parts[0], tuple):
+                continue
+            row = mail_parse(parts[0][1])
+            row["seq"] = uid.decode()
+            out.append(row)
+        return out
+    finally:
+        try:
+            box.logout()
+        except Exception:
+            pass
+
+
+def cmd_mail(args):
+    sub = getattr(args, "mail_cmd", None)
+    if sub == "setup":
+        import getpass, subprocess
+        user = args.address
+        pw = getpass.getpass("App-specific password for %s (from appleid.apple.com → Sign-In and Security → App-Specific Passwords): " % user)
+        if not pw.strip():
+            die("no password given")
+        r = subprocess.run(["security", "add-generic-password", "-U", "-s", MAIL_KEYCHAIN_SERVICE, "-a", user,
+                            "-l", "WorkFlow Agent Bridge — iCloud Mail (read-only)", "-w", pw.strip()],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            die("Keychain refused: " + r.stderr.strip())
+        MAIL_CONFIG.write_text(json.dumps({"user": user, "host": args.host}, indent=2))
+        print(f"stored in the login Keychain as service “{MAIL_KEYCHAIN_SERVICE}”; config {MAIL_CONFIG}")
+        print("try:  wf mail            (lists unread, read-only)")
+        return
+    if sub == "mark":
+        state = _mail_state()
+        now = time.time()
+        for mid in args.ids:
+            state["handled"][mid] = now
+        _mail_save_state(state)
+        print(f"marked {len(args.ids)} handled")
+        return
+    if sub == "install":
+        mail_launchd_install(args)
+        return
+    if sub == "uninstall":
+        os.system(f"launchctl bootout gui/$(id -u)/{MAIL_LABEL} 2>/dev/null")
+        if MAIL_PLIST.exists():
+            MAIL_PLIST.unlink()
+        print("removed", MAIL_PLIST)
+        return
+    if sub == "status":
+        print(f"config      {MAIL_CONFIG if MAIL_CONFIG.exists() else 'not set up'}")
+        print(f"launchd     {'installed' if MAIL_PLIST.exists() else 'not installed'}")
+        st = _mail_state()
+        print(f"handled     {len(st['handled'])} message id(s) on file")
+        return
+
+    # default: list
+    rows = mail_fetch_unread(limit=args.limit)
+    if args.new:
+        handled = _mail_state()["handled"]
+        rows = [r for r in rows if r["id"] not in handled]
+    if args.json:
+        print(json.dumps({"messages": rows, "fetchedAt": datetime.now().isoformat(timespec="minutes")}, indent=2))
+        return
+    if not rows:
+        print("no unread messages" + (" that aren't already handled" if args.new else ""))
+        return
+    for r in rows:
+        print(f"{(r['date'] or '')[:16]:16}  {r['from'][:34]:34}  {r['subject'][:60]}")
+        if args.verbose and r["preview"]:
+            print("    " + r["preview"].replace("\n", "\n    ")[:400])
+            print("    id " + r["id"])
+
+
+def mail_launchd_install(args):
+    if not WAKE_CONFIG.exists():
+        die("run `wf wake install` first — the mail runner shares its config")
+    _mail_config()
+    plist = {
+        "Label": MAIL_LABEL,
+        "ProgramArguments": ["/bin/bash", str(MAIL_SCRIPT)],
+        "StartInterval": int(args.every) * 60,
+        "RunAtLoad": False,
+        "StandardErrorPath": str(Path.home() / "Library/Logs/claude-mail.log"),
+    }
+    MAIL_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    with open(MAIL_PLIST, "wb") as fh:
+        plistlib.dump(plist, fh)
+    os.system(f"launchctl bootout gui/$(id -u)/{MAIL_LABEL} 2>/dev/null")
+    rc = os.system(f"launchctl bootstrap gui/$(id -u) {MAIL_PLIST} 2>/dev/null")
+    print(f"installed  {MAIL_PLIST}  (every {args.every} min)")
+    if rc != 0:
+        print("launchctl bootstrap returned non-zero — check: launchctl print gui/$(id -u)/" + MAIL_LABEL)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="wf", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("state", help="bridge status, folder and snapshot").set_defaults(func=cmd_state)
+    sub.add_parser("ping", help="confirm the app is watching").set_defaults(func=cmd_ping)
+    sub.add_parser("queue", help="tasks assigned to the agent").set_defaults(func=cmd_queue)
+    sub.add_parser("setup", help="install the agent workspace + smart list").set_defaults(func=cmd_setup)
+
+    p = sub.add_parser("tasks", help="list tasks")
+    p.add_argument("--all", action="store_true", help="include archived and hidden")
+    p.set_defaults(func=cmd_tasks)
+
+    p = sub.add_parser("show", help="one task with its comment thread")
+    p.add_argument("task")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("comment", help="post a comment as the agent")
+    p.add_argument("task")
+    p.add_argument("text")
+    p.add_argument("--mention", action="append", help="repeatable")
+    p.set_defaults(func=cmd_comment)
+
+    p = sub.add_parser("add", help="create a task")
+    p.add_argument("title")
+    p.add_argument("--project")
+    p.add_argument("--notes")
+    p.add_argument("--due", help="ISO-8601 or yyyy-MM-dd")
+    p.add_argument("--priority", choices=["High", "Medium", "Low"])
+    p.add_argument("--status", help="To Do / In Progress / Completed")
+    p.add_argument("--tag", action="append", help="repeatable")
+    p.add_argument("--subtask", action="append", help="repeatable")
+    p.add_argument("--comment", help="opening comment on the new task")
+    p.add_argument("--assignee", help=f'"{AGENT_NAME}" puts it in the agent queue')
+    p.add_argument("--status-note", dest="status_note", help="seed the pinned note")
+    p.set_defaults(func=cmd_add)
+
+    p = sub.add_parser("check", help="tick subtasks off")
+    p.add_argument("task")
+    p.add_argument("subtask", nargs="+")
+    p.set_defaults(func=cmd_check, uncheck=False)
+
+    p = sub.add_parser("uncheck", help="untick subtasks")
+    p.add_argument("task")
+    p.add_argument("subtask", nargs="+")
+    p.set_defaults(func=cmd_check, uncheck=True)
+
+    p = sub.add_parser("rename", help="retitle a subtask in place, keeping its tick")
+    p.add_argument("task")
+    p.add_argument("old", help="current title — exact, or a fragment it contains")
+    p.add_argument("new")
+    p.set_defaults(func=cmd_rename)
+
+    p = sub.add_parser("status", help="set a task's pinned note")
+    p.add_argument("task")
+    p.add_argument("text")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("done", help="complete a task")
+    p.add_argument("task")
+    p.set_defaults(func=cmd_done)
+
+    p = sub.add_parser("project", help="create or update a project")
+    p.add_argument("name")
+    p.add_argument("--icon")
+    p.add_argument("--color", help="#RRGGBB")
+    p.add_argument("--description")
+    p.set_defaults(func=cmd_project)
+
+    p = sub.add_parser("pack", help="install a ProjectPack JSON file")
+    p.add_argument("file")
+    p.add_argument("--library-only", action="store_true",
+                   help="add templates without creating the projects")
+    p.add_argument("--skip-existing", action="store_true",
+                   help="don't duplicate projects that already exist")
+    p.set_defaults(func=cmd_pack)
+
+    p = sub.add_parser("mail", help="iCloud inbox over IMAP, read-only (Tier 3)")
+    p.add_argument("--new", action="store_true", help="only messages not yet marked handled")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("-v", "--verbose", action="store_true")
+    ms = p.add_subparsers(dest="mail_cmd")
+    q = ms.add_parser("setup", help="store the app-specific password in the Keychain")
+    q.add_argument("address")
+    q.add_argument("--host", default="imap.mail.me.com")
+    q = ms.add_parser("mark", help="record message ids as handled")
+    q.add_argument("ids", nargs="+")
+    q = ms.add_parser("install", help="launchd runner: hand new unread mail to a session")
+    q.add_argument("--every", default="30", help="minutes between runs")
+    ms.add_parser("uninstall")
+    ms.add_parser("status")
+    p.set_defaults(func=cmd_mail)
+
+    p = sub.add_parser("notes", help="the Notepad inbox")
+    p.add_argument("--all", action="store_true", help="include archived")
+    p.set_defaults(func=cmd_notes)
+
+    p = sub.add_parser("note", help="one note in full")
+    p.add_argument("note")
+    p.set_defaults(func=cmd_note)
+
+    p = sub.add_parser("jot", help="file output into the Notepad")
+    p.add_argument("title")
+    p.add_argument("--body")
+    p.add_argument("--color", help="#RRGGBB")
+    p.add_argument("--pin", action="store_true")
+    p.set_defaults(func=cmd_jot)
+
+    p = sub.add_parser("convert", help="promote a note into a task")
+    p.add_argument("note")
+    p.add_argument("--project", help=f"default: the {AGENT_NAME} project")
+    p.add_argument("--title", help="override the task title")
+    p.add_argument("--priority", choices=["High", "Medium", "Low"])
+    p.add_argument("--due", help="ISO-8601 or yyyy-MM-dd")
+    p.add_argument("--assignee", help=f"default: {AGENT_NAME}")
+    p.add_argument("--subtask", action="append", help="repeatable")
+    p.set_defaults(func=cmd_convert)
+
+    p = sub.add_parser("reply", help="append a signed reply inside a note")
+    p.add_argument("note")
+    p.add_argument("text")
+    p.add_argument("--pin", action="store_true", help="also pin the note")
+    p.set_defaults(func=cmd_reply)
+
+    p = sub.add_parser("attach", help="attach a file to a task")
+    p.add_argument("task")
+    p.add_argument("file")
+    p.add_argument("--name", help="display name (default: the filename)")
+    p.set_defaults(func=cmd_attach)
+
+    p = sub.add_parser("sweep", help="portfolio sweep: notes → per-app fix lists, versions")
+    p.add_argument("action", nargs="?", choices=["install", "status", "uninstall"],
+                   help="manage the weekly launchd job (omit to run a sweep now)")
+    p.add_argument("--apply", action="store_true", help="file notes and refresh versions (default: report only)")
+    p.add_argument("--json", action="store_true", help="machine-readable report")
+    p.add_argument("--day", help="install: weekday, default mon")
+    p.add_argument("--at", help="install: HH:MM local, default 09:00")
+    p.set_defaults(func=cmd_sweep)
+
+    p = sub.add_parser("wake", help="launchd trigger for assigned tasks")
+    p.add_argument("action", choices=["install", "status", "uninstall"])
+    p.add_argument("--dir", help="working directory for the session (default: repo root)")
+    p.add_argument("--claude", help="path to the claude binary")
+    p.add_argument("--model", help="model for unattended sessions (e.g. opus); "
+                                   "default lets the CLI choose, which can hit a usage limit")
+    p.set_defaults(func=cmd_wake)
+
+    p = sub.add_parser("poll", help="comments addressed to the agent")
+    p.add_argument("--since", help="ISO-8601; defaults to the stored watermark")
+    p.set_defaults(func=cmd_poll)
+
+    p = sub.add_parser("session", help=f"Claude's cross-session log ({SESSIONS_PROJECT} project)")
+    p.add_argument("codebase", nargs="?", help="task title; default: the working folder's name")
+    p.add_argument("--log", help="append a session comment")
+    p.add_argument("--state", help="replace the one-line current state (pinned note)")
+    p.add_argument("--open", action="append", help="add an open loop (repeatable)")
+    p.add_argument("--close", action="append", help="tick an open loop (repeatable)")
+    p.add_argument("--all", action="store_true", help="show every session comment, not the last 3")
+    p.add_argument("--list", action="store_true", help="every codebase with its state line")
+    p.add_argument("--attach", action="append", metavar="FILE",
+                   help="attach evidence; the comment records the original path (repeatable)")
+    p.add_argument("--to", metavar="TASK", help="attach to this task instead (id or title fragment)")
+    p.add_argument("--weekly", action="store_true", help="post the week's session counts on the housekeeping task")
+    p.set_defaults(func=cmd_session)
+
+    p = sub.add_parser("handoff", help=f"a task for {OWNER}, tagged {HANDOFF_TAG}, on the “{HANDOFF_LIST}” list")
+    p.add_argument("title")
+    p.add_argument("--project", default=HANDOFF_PROJECT)
+    p.add_argument("--notes", help="what and why, in the owner's terms")
+    p.add_argument("--command", action="append", help="exact command(s) to run (repeatable)")
+    p.add_argument("--due", help="ISO-8601 or yyyy-MM-dd")
+    p.add_argument("--priority", choices=["High", "Medium", "Low"], default="High")
+    p.add_argument("--why", help="opening comment: what it unblocks")
+    p.set_defaults(func=cmd_handoff)
+
+    p = sub.add_parser("job", help="a checklist task Claude ticks as it works")
+    p.add_argument("title")
+    p.add_argument("--template", choices=sorted(JOB_TEMPLATES))
+    p.add_argument("--step", action="append", help="extra step (repeatable)")
+    p.add_argument("--why", help="opening comment")
+    p.set_defaults(func=cmd_job)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

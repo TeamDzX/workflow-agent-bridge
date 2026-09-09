@@ -1,0 +1,7 @@
+# Local configuration and state — never publish these.
+agent-bridge/wake.config
+agent-bridge/mail.config
+agent-bridge/.wake-seen
+*.log
+.DS_Store
+__pycache__/
