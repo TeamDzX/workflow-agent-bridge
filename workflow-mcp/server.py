@@ -180,6 +180,49 @@ TOOLS = [
                                       uncheck=a.get("uncheck", False)),
     },
     {
+        "name": "workflow_add_subtasks",
+        "description": "Add rows to an existing task's checklist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"task": {"type": "string"}, "subtasks": {"type": "array", "items": {"type": "string"}}},
+            "required": ["task", "subtasks"],
+        },
+        "handler": lambda a: call_cli(WF.cmd_subtask, task=a["task"], action="add", items=a["subtasks"]),
+    },
+    {
+        "name": "workflow_remove_subtasks",
+        "description": "Delete rows from a task's checklist. Each entry must be an exact title or a fragment only one row contains; anything ambiguous is left alone.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"task": {"type": "string"}, "subtasks": {"type": "array", "items": {"type": "string"}}},
+            "required": ["task", "subtasks"],
+        },
+        "handler": lambda a: call_cli(WF.cmd_subtask, task=a["task"], action="remove", items=a["subtasks"]),
+    },
+    {
+        "name": "workflow_update_task",
+        "description": "Change an existing task; only the fields passed are touched. 'notes' REPLACES the notes; prefer 'append_notes', which adds to the end and keeps the user's formatting.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string"}, "title": {"type": "string"},
+                "notes": {"type": "string"}, "append_notes": {"type": "string"},
+                "priority": {"type": "string", "enum": ["High", "Medium", "Low"]},
+                "status": {"type": "string"}, "assignee": {"type": "string"}, "project": {"type": "string"},
+                "add_tags": {"type": "array", "items": {"type": "string"}},
+                "remove_tags": {"type": "array", "items": {"type": "string"}},
+                "in_my_day": {"type": "boolean"},
+            },
+            "required": ["task"],
+        },
+        "handler": lambda a: call_cli(WF.cmd_edit, task=a["task"], title=a.get("title"),
+                                      notes=a.get("notes"), notes_file=None, append_notes=a.get("append_notes"),
+                                      priority=a.get("priority"), status=a.get("status"),
+                                      assignee=a.get("assignee"), project=a.get("project"),
+                                      add_tag=a.get("add_tags"), remove_tag=a.get("remove_tags"),
+                                      my_day=a.get("in_my_day")),
+    },
+    {
         "name": "workflow_rename_subtask",
         "description": "Retitle one subtask in place, keeping its tick state — for correcting a row's wording (a version line on an index, say) without adding a duplicate.",
         "inputSchema": {

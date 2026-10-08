@@ -42,6 +42,9 @@ and marketing — say so in one line each in the summary instead.
 For each task:
   $HERE/wf add "<subject, tidied>" --project "Mail" --notes "From: <sender>\\nSent: <date>\\nOpen in Mail: <link>\\n\\n<preview>" [--due yyyy-MM-dd when the email names a date]
 
+If the message has "attachments", put its files on the task you just made:
+  $HERE/wf mail attach <id> "<task title or id>"
+
 Then mark the whole batch handled so it is never offered again:
   $HERE/wf mail mark <id> <id> ...      (every id in the batch, filed or skipped)
 

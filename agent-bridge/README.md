@@ -95,9 +95,35 @@ wf convert <note> [--project P] [--title T] [--priority High]
 wf check <task> <subtask>...    Tick subtasks off
 wf uncheck <task> <subtask>...  Untick subtasks
 wf rename <task> <old> <new>    Retitle a subtask in place (tick kept)
+wf edit <task> [--title T] [--notes N | --notes-file F] [--append-notes T]
+        [--priority P] [--status S] [--assignee A] [--project P]
+        [--add-tag T]... [--remove-tag T]... [--my-day | --no-my-day]
+                                Change an existing task (4.9.4); only what you
+                                pass is touched. Prefer --append-notes: it keeps
+                                the user's formatting, --notes replaces it all
+wf subtask <task> add|remove <title>...
+                                Add or delete checklist rows (4.9.4); remove
+                                needs an exact title or a fragment only one row has
+wf docs [query] [--project P] [--type T] [--status S] [--json]
+                                List or search documents (5.0): names, WF-numbers,
+                                profiles and the text inside PDFs, scans, text files
+wf doc <doc>                    One document: profile, versions, start of its text
+wf doc-set <doc> [--name N] [--type T] [--status S] [--author A]
+        [--description D] [--folder F]
+                                Change a document's profile or folder ('' unfiles)
+wf doc-version <doc> <file> [--comment C]
+                                Upload a new version; the old one stays in history
+wf file <project> <file> [--folder F] [--type T] …
+                                File a document into a project's workspace
+wf mail attach <message-id> <task>
+                                Put an email's own files on the task made from it
 wf status <task> <text>         Set a task's pinned note
 wf attach <task> <file> [--name N]
                                 Attach a file to a task (staged via attachments/)
+wf email <task> --to A --subject S (--body B | --body-file F) [--cc C] [--send]
+                                Draft an email onto the task for Review & Send;
+                                --send sends it via iCloud SMTP when Settings →
+                                Agent Bridge → Email is Can Send (4.9.4)
 wf done <task>                  Complete a task
 wf project <name> [--icon I] [--color '#RRGGBB'] [--description D]
 wf pack <file.json> [--skip-existing]
@@ -212,7 +238,7 @@ not next Monday.
 happens to be running.
 
 ```sh
-wf wake install [--dir <working dir>] [--claude <path>]
+wf wake install [--dir <working dir>] [--claude <path>] [--model opus] [--max-minutes 60]
 wf wake status
 wf wake uninstall
 ```
@@ -221,6 +247,22 @@ The app writes a signal file when scoped work appears; launchd watches that
 directory and runs `claude-wake.sh`, which starts one headless session. Two
 keys, deliberately: the app only signals, and nothing listens until you install
 the agent.
+
+**Nobody is at the Mac during a woken session**, so it must never raise a macOS
+dialog. Twice (9 and 21 Sep) a session sat for 7 and 10 hours behind an
+unanswered "wants to control Mail" / files prompt. Three guards against that:
+
+- The session runs with `osascript`, `open`, `automator` and `shortcuts`
+  denied, and its prompt says not to drive apps or reach into protected
+  folders.
+- A session is stopped after `--max-minutes` (default 60), together with
+  anything it started, such as an `osascript` waiting on a dialog. The task
+  gets a comment saying so and naming the likely cause.
+- A stopped session isn't retried automatically, because it may have done
+  part of the work. Mention it again to resume.
+
+If you do want background sessions to have one of those permissions, grant it
+once from a normal Terminal window, where you can answer the dialog.
 
 ### Switching it off
 

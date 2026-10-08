@@ -16,6 +16,11 @@ running on the same machine.
 
 WorkFlow for Mac: https://apps.apple.com/app/id6777460380
 
+**Not on a Mac?** [WorkFlow Companion](https://github.com/TeamDzX/workflow-companion)
+gives Claude on Windows or Linux the same tools through your own iCloud, with
+WorkFlow on an iPhone, iPad or Mac doing the work. All of Opticell's free tools
+for Claude are listed in [opticell-mcp](https://github.com/TeamDzX/opticell-mcp).
+
 ## How it works
 
 **Reads** go straight to `snapshot.json` in the bridge folder — tasks with
@@ -71,6 +76,8 @@ covers the Claude Desktop route.
 | `WF_BRIDGE` | Path to the bridge folder. Otherwise `wf` finds it through the app's pointer file, then the container. |
 | `WF_OWNER` | Whose desk `wf handoff` puts a task on. Defaults to the Mac account name. |
 | `WF_OWNER_PROJECT` | Default project for those handoffs. |
+| `WF_PORTFOLIO_PROJECT` | Project `wf sweep` files its per-app "updates & fixes" lists in. |
+| `WF_SELLER` | App Store seller name `wf sweep` matches when it looks up your apps. |
 
 ## Requirements
 

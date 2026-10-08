@@ -35,6 +35,9 @@ Usage
   wf check|uncheck <task> <sub>...  Tick subtasks
   wf rename <task> <old> <new>      Retitle a subtask in place (tick kept)
   wf status <task> <text>           Set a task's pinned note (its status line)
+  wf due <task> <date|none|park>    Move a due date; 'none' removes it entirely
+  wf agenda [--days N] [--json]     Overdue / today / next up, from the snapshot
+  wf agenda install|status|uninstall  Daily digest; --triage wakes a session when overdue
   wf done <task>                    Complete a task
   wf project <name> [...]           Create or update a project
   wf pack <file.json>               Install a ProjectPack
@@ -64,11 +67,12 @@ import getpass
 import json
 import os
 import plistlib
+import re
 import sqlite3
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # The Mac app's own container. WF_CONTAINER overrides it — useful against a
@@ -229,6 +233,14 @@ def all_tasks(include_hidden=False):
                 "project": t.get("project", ""),
                 "assignee": t.get("assignee", ""),
                 "due": parse_iso(t.get("dueDate")),
+                # 4.7 and later. An older app writes neither, so `hasDueDate`
+                # defaults to True (every task was dated before 4.7) and
+                # `hasReminder` to None, which reads as "this snapshot can't
+                # say" rather than "no alert".
+                "hasDue": t.get("hasDueDate", True),
+                "hasReminder": t.get("hasReminder"),
+                "snoozed": bool(t.get("isSnoozed")),
+                "inMyDay": bool(t.get("isInMyDay")),
                 "updated": parse_iso(t.get("updatedAt")),
                 "pinnedNote": t.get("pinnedNote", ""),
                 "notes": t.get("notes", ""),
@@ -247,6 +259,10 @@ def all_tasks(include_hidden=False):
                 "title": r["ZTITLE"] or "",
                 "status": r["ZSTATUS"] or "",
                 "priority": r["ZPRIORITY"] or "",
+                "hasDue": True,
+                "hasReminder": None,
+                "snoozed": False,
+                "inMyDay": False,
                 "project": r["ZPROJECT"] or "",
                 "assignee": r["ZASSIGNEE"] or "",
                 "due": apple_time(r["ZDUEDATE"]),
@@ -532,9 +548,203 @@ def cmd_rename(args):
     send("update_task", taskID=task["id"], renameSubtasks=[{"from": args.old, "to": args.new}])
 
 
+def cmd_edit(args):
+    """Change an existing task. Only the fields given are touched."""
+    task = find_task(args.task)
+    notes = Path(args.notes_file).expanduser().read_text() if args.notes_file else args.notes
+    fields = dict(title=args.title, notes=notes, appendNotes=args.append_notes,
+                  priority=args.priority, status=args.status, assignee=args.assignee,
+                  project=args.project, addTags=args.add_tag, removeTags=args.remove_tag,
+                  isInMyDay=args.my_day)
+    if all(v is None for v in fields.values()):
+        die("nothing to change — see wf edit --help")
+    send("update_task", taskID=task["id"], **fields)
+
+
+def cmd_subtask(args):
+    task = find_task(args.task)
+    key = {"add": "addSubtasks", "remove": "removeSubtasks"}[args.action]
+    send("update_task", **{"taskID": task["id"], key: args.items})
+
+
 def cmd_status(args):
     task = find_task(args.task)
     send("update_task", taskID=task["id"], pinnedNote=args.text)
+
+
+# ------------------------------------------------------------------- agenda
+
+AGENDA_BUCKETS = ("overdue", "today", "soon", "upcoming", "undated")
+
+
+def _agenda(days=7):
+    """The same buckets the app's Dashboard shows, from the same snapshot the
+    app writes — so a person and an agent read one source, not two.
+
+    Completed, hidden and snoozed tasks are out: a snoozed task has been
+    explicitly pushed out of sight, and listing it in a digest undoes the one
+    thing the user asked for.
+    """
+    today = datetime.now().astimezone().date()
+    horizon = today + timedelta(days=days)
+    out = {k: [] for k in AGENDA_BUCKETS}
+    alerts = []
+    for t in all_tasks():
+        if t["status"] == "Completed" or t["snoozed"]:
+            continue
+        if t.get("hasReminder"):
+            alerts.append(t)
+        if not t["hasDue"]:
+            out["undated"].append(t)
+            continue
+        if not t["due"]:
+            continue
+        d = local(t["due"]).date()
+        if d < today:
+            out["overdue"].append(t)
+        elif d == today:
+            out["today"].append(t)
+        elif d <= horizon:
+            out["soon"].append(t)
+        else:
+            out["upcoming"].append(t)
+    for k in out:
+        out[k].sort(key=lambda r: (r["due"] or EPOCH, r["title"].lower()))
+    alerts.sort(key=lambda r: (r["due"] or EPOCH))
+    return out, alerts
+
+
+def _agenda_line(t):
+    when = local(t["due"]).strftime("%-d %b") if t["due"] and t["hasDue"] else "no date"
+    where = t["project"] or "no project"
+    bell = " 🔔" if t.get("hasReminder") else ""
+    return f"{t['title']}  ·  {where}  ·  {when}{bell}"
+
+
+AGENDA_LABEL = "app.workflow.claude-agenda"
+AGENDA_PLIST = Path.home() / "Library/LaunchAgents" / f"{AGENDA_LABEL}.plist"
+AGENDA_SCRIPT = HERE / "claude-agenda.sh"
+
+
+def agenda_launchd(args):
+    if args.action == "status":
+        print(f"launchd agent   {'installed' if AGENDA_PLIST.exists() else 'not installed'}")
+        if AGENDA_PLIST.exists():
+            out = os.popen(f"launchctl list 2>/dev/null | grep {AGENDA_LABEL}").read().strip()
+            print(f"loaded          {'yes' if out else 'no'}")
+            print(f"plist           {AGENDA_PLIST}")
+        return
+    if args.action == "uninstall":
+        os.system(f"launchctl bootout gui/$(id -u)/{AGENDA_LABEL} 2>/dev/null")
+        if AGENDA_PLIST.exists():
+            AGENDA_PLIST.unlink()
+        print("Morning agenda removed.")
+        return
+    if not WAKE_CONFIG.exists():
+        die("run `wf wake install` first — the agenda shares its config (bridge folder, claude path).")
+    hour, minute = (args.at or "08:00").split(":")
+    log_file = str(Path.home() / "Library/Logs/claude-agenda.log")
+    env = {}
+    if args.post:
+        env["AGENDA_POST_TO"] = args.post
+    if args.triage:
+        env["AGENDA_TRIAGE"] = "1"
+    plist = {
+        "Label": AGENDA_LABEL,
+        "ProgramArguments": ["/bin/bash", str(AGENDA_SCRIPT)],
+        "StartCalendarInterval": {"Hour": int(hour), "Minute": int(minute)},
+        "RunAtLoad": False,
+        "StandardErrorPath": log_file,
+    }
+    if env:
+        plist["EnvironmentVariables"] = env
+    AGENDA_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    with open(AGENDA_PLIST, "wb") as fh:
+        plistlib.dump(plist, fh)
+    os.system(f"launchctl bootout gui/$(id -u)/{AGENDA_LABEL} 2>/dev/null")
+    rc = os.system(f"launchctl bootstrap gui/$(id -u) {AGENDA_PLIST} 2>/dev/null")
+    print(f"installed  {AGENDA_PLIST}")
+    print(f"runs       daily at {args.at or '08:00'}")
+    print(f"posts      {'to ' + args.post if args.post else 'to the log only (pass --post TASK to file it)'}")
+    print(f"triage     {'on — wakes a session only when something is overdue' if args.triage else 'off'}")
+    print(f"log        {log_file}")
+    if rc != 0:
+        print("launchctl bootstrap reported a problem — check: wf agenda status")
+
+
+def cmd_agenda(args):
+    if getattr(args, "action", None):
+        return agenda_launchd(args)
+    buckets, alerts = _agenda(args.days)
+    counts = {k: len(v) for k, v in buckets.items()}
+
+    if args.json:
+        payload = {
+            "generatedAt": datetime.now().astimezone().isoformat(),
+            "horizonDays": args.days,
+            "counts": counts,
+            "alerts": len(alerts),
+            "tasks": {
+                k: [{"id": t["id"], "title": t["title"], "project": t["project"],
+                     "priority": t["priority"], "assignee": t["assignee"],
+                     "due": t["due"].isoformat() if t["due"] and t["hasDue"] else None,
+                     "hasReminder": t.get("hasReminder"),
+                     "inMyDay": t["inMyDay"]}
+                    for t in v]
+                for k, v in buckets.items()
+            },
+        }
+        print(json.dumps(payload, indent=2))
+        return
+
+    text = _agenda_text(buckets, alerts, args.days, limit=args.limit)
+    print(text)
+    if args.post:
+        task = find_task(args.post)
+        send("add_comment", taskID=task["id"], text=text)
+
+
+def _agenda_text(buckets, alerts, days, limit=5):
+    counts = {k: len(v) for k, v in buckets.items()}
+    head = (f"Agenda for {datetime.now():%A %-d %B} — "
+            f"{counts['overdue']} overdue, {counts['today']} due today, "
+            f"{counts['soon']} in the next {days} days, "
+            f"{counts['upcoming']} later, {counts['undated']} with no date.")
+    lines = [head]
+    # `hasReminder` is None on a pre-4.7 snapshot: say nothing rather than
+    # report "0 alerts", which would be a claim the data can't support.
+    if any(t.get("hasReminder") is not None for v in buckets.values() for t in v):
+        lines.append(f"{len(alerts)} of them carry an alert.")
+    for key, title in (("overdue", "Overdue"), ("today", "Today"), ("soon", "Next up")):
+        rows = buckets[key]
+        if not rows:
+            continue
+        lines.append("")
+        lines.append(f"{title} ({len(rows)})")
+        for t in rows[:limit]:
+            lines.append(f"  · {_agenda_line(t)}")
+        if len(rows) > limit:
+            lines.append(f"  … and {len(rows) - limit} more")
+    return "\n".join(lines)
+
+
+def cmd_due(args):
+    """Move a task's due date, or park it out of the way.
+
+    `PMTask.dueDate` is not optional, so there is no such thing as a task with
+    no due date — "park" is the nearest honest thing: a date far enough out
+    that the task stops counting as overdue while it is still a standing
+    record rather than a deadline.
+    """
+    task = find_task(args.task)
+    if args.date == "none":
+        send("update_task", taskID=task["id"], hasDueDate=False)
+        print(f"{task['title']}  ·  no due date")
+        return
+    when = SESSIONS_PARKED_DUE if args.date == "park" else args.date
+    send("update_task", taskID=task["id"], dueDate=when,
+         **({"hasDueDate": False} if args.date == "park" else {}))
+    print(f"{task['title']}  ·  due {when}")
 
 
 def cmd_setup(args):
@@ -562,7 +772,7 @@ def cmd_notes(args):
         if row["convertedAt"]:
             flags.append(f"-> {row['convertedTargetName']}")
         body = (row["body"] or "").strip().replace("\n", " ")
-        marker = "*" if NOTE_MARKER in (row["title"] + body).lower() else " "
+        marker = "*" if re.search(r"(?<![A-Za-z0-9_])" + re.escape(NOTE_MARKER) + r"(?![A-Za-z0-9_])", row["title"] + "\n" + body, re.I) else " "
         head = f"{marker} {note_title(row)}"
         if flags:
             head += f"  ({', '.join(flags)})"
@@ -616,6 +826,140 @@ def cmd_attach(args):
     send("attach_file", taskID=task["id"], fileName=src.name, displayName=args.name)
 
 
+# ---------------------------------------------------------------- documents (5.0)
+#
+# Documents are every file in WorkFlow — on a task, on a note, or filed into a
+# project's workspace — each with a number ("WF-4F2A91"), a profile (type,
+# status, author, description, folder) and a version history. These commands
+# read them from the snapshot and change them through the app.
+
+def all_documents():
+    snap = load_snapshot()
+    if snap is None or "documents" not in snap:
+        die("no documents in the snapshot — this needs WorkFlow 5.0 with the bridge on")
+    return snap["documents"]
+
+
+def find_document(needle):
+    rows = all_documents()
+    n = needle.strip().lower()
+    for key in ("id", "number"):
+        hit = [r for r in rows if r.get(key, "").lower() == n or
+               (key == "id" and any(v.get("id", "").lower() == n for v in r.get("versions", [])))]
+        if hit:
+            return hit[0]
+    exact = [r for r in rows if r.get("name", "").lower() == n]
+    if exact:
+        return exact[0]
+    partial = [r for r in rows if n in r.get("name", "").lower()]
+    if not partial:
+        die(f'no document matching "{needle}" — try a number like WF-4F2A91, or wf docs')
+    if len(partial) > 1:
+        print(f'wf: "{needle}" matched {len(partial)} documents, using the most recent:', file=sys.stderr)
+        for r in partial[:5]:
+            print(f"       {r['number']}  {r['name']}", file=sys.stderr)
+    return sorted(partial, key=lambda r: r.get("updatedAt", ""), reverse=True)[0]
+
+
+def document_line(d):
+    bits = [f"{d['number']} v{d['version']}", d["name"]]
+    if d.get("type"):
+        bits.append(f"[{d['type']}]")
+    if d.get("status"):
+        bits.append(f"({d['status']})")
+    where = d.get("task") or (f"workspace {d['project']}" if d.get("inWorkspace") else "note")
+    if d.get("folder"):
+        where += f" / {d['folder']}"
+    return "  ".join(bits) + f"  — {where}"
+
+
+def cmd_docs(args):
+    rows = all_documents()
+    q = (args.query or "").lower()
+    def hit(d):
+        if args.project and d.get("project", "").lower() != args.project.lower():
+            return False
+        if args.type and d.get("type", "").lower() != args.type.lower():
+            return False
+        if args.status and d.get("status", "").lower() != args.status.lower():
+            return False
+        if not q:
+            return True
+        fields = [d.get(k, "") for k in ("number", "name", "type", "status", "author", "description",
+                                         "folder", "project", "task", "text")]
+        return any(q in (f or "").lower() for f in fields)
+    rows = sorted((d for d in rows if hit(d)), key=lambda d: d.get("updatedAt", ""), reverse=True)
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("no documents match")
+        sys.exit(1)
+    for d in rows[: args.limit]:
+        print(document_line(d))
+    if len(rows) > args.limit:
+        print(f"… and {len(rows) - args.limit} more (--limit)")
+
+
+def cmd_doc(args):
+    d = find_document(args.doc)
+    if args.json:
+        print(json.dumps(d, indent=2))
+        return
+    print(document_line(d))
+    for label, key in (("type", "type"), ("status", "status"), ("author", "author"),
+                       ("description", "description"), ("folder", "folder"), ("project", "project")):
+        if d.get(key):
+            print(f"  {label:<12} {d[key]}")
+    print(f"  {'file':<12} {d['fileType']}, {d['size']:,} bytes, updated {d['updatedAt'][:10]}")
+    print("  versions")
+    for v in d.get("versions", []):
+        note = f" — {v['comment']}" if v.get("comment") else ""
+        print(f"    v{v['version']}  {v['createdAt'][:16].replace('T', ' ')}  {v['name']}{note}")
+    if d.get("text"):
+        print("  text (start)")
+        print("    " + d["text"][:600].replace("\n", "\n    "))
+
+
+def _profile_fields(args):
+    return dict(documentName=getattr(args, "name", None), docType=args.type, docStatus=args.status,
+                docAuthor=args.author, docSummary=args.description, docFolder=args.folder)
+
+
+def cmd_doc_set(args):
+    d = find_document(args.doc)
+    fields = _profile_fields(args)
+    if all(v is None for v in fields.values()):
+        die("nothing to change — see wf doc-set --help")
+    send("update_document", documentID=d["id"], **fields)
+
+
+def _stage(path):
+    import shutil
+    src = Path(path).expanduser()
+    if not src.is_file():
+        die(f"no such file: {src}")
+    ATTACHMENTS.mkdir(parents=True, exist_ok=True)
+    staged = ATTACHMENTS / src.name
+    if src.resolve() != staged.resolve():
+        shutil.copyfile(src, staged)
+    return src.name
+
+
+def cmd_doc_version(args):
+    d = find_document(args.doc)
+    name = _stage(args.file)
+    send("add_document_version", documentID=d["id"], fileName=name, versionComment=args.comment)
+
+
+def cmd_file(args):
+    """File a document straight into a project's workspace."""
+    name = _stage(args.file)
+    send("attach_file", project=args.project, fileName=name, displayName=args.name,
+         docType=args.type, docStatus=args.status, docAuthor=args.author,
+         docSummary=args.description, docFolder=args.folder)
+
+
 def cmd_reply(args):
     """Answer a note *in the note*. Notes have no comment thread, so the reply
     is appended to the body — signed and dated, never overwriting a word of
@@ -629,9 +973,9 @@ def cmd_reply(args):
 
 INDEX_TASK = "Sprint and Updates"
 SWEEP_STATE = BRIDGE / "sweep-state.json"
-PORTFOLIO_PROJECT = "Opticell"
+PORTFOLIO_PROJECT = os.environ.get("WF_PORTFOLIO_PROJECT", "Opticell")
 PORTFOLIO_TAG = "portfolio"
-SELLER = "opticell"
+SELLER = os.environ.get("WF_SELLER", "opticell").lower()   # App Store seller name to match
 
 
 def _app_names_from_index():
@@ -894,8 +1238,36 @@ def cmd_done(args):
 
 
 def cmd_project(args):
+    def date_arg(v):
+        return None if v in (None, "none") else v
     send("create_project", name=args.name, icon=args.icon,
-         colorHex=args.color, projectDescription=args.description)
+         colorHex=args.color, projectDescription=args.description,
+         projectStatus=args.status, startDate=date_arg(args.start), targetDate=date_arg(args.target),
+         clearStartDate=True if args.start == "none" else None,
+         clearTargetDate=True if args.target == "none" else None)
+
+
+def cmd_projects(args):
+    """The portfolio: status, plan and health, as the Projects tab shows them."""
+    snap = load_snapshot()
+    rows = [p for p in (snap or {}).get("projects", []) if args.all or not p.get("isArchived")]
+    if rows and "health" not in rows[0]:
+        die("this needs WorkFlow 5.1 with the bridge on")
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    order = ["overdue", "atRisk", "idle", "onTrack", "planning", "onHold", "done"]
+    rows.sort(key=lambda p: (order.index(p["health"]) if p["health"] in order else 9, p["name"].lower()))
+    def day(iso):
+        # The snapshot is UTC; a date set as local midnight would print a day early.
+        if not iso:
+            return ""
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d")
+    for p in rows:
+        plan = ""
+        if p.get("startDate") or p.get("targetDate"):
+            plan = f"  {day(p.get('startDate'))}→{day(p.get('targetDate'))}"
+        print(f"{p['health']:<9} {p['status']:<9} {int(p['progress']*100):>3}%  {p['name']}{plan}  — {p['healthReason']}")
 
 
 def cmd_pack(args):
@@ -910,6 +1282,16 @@ def cmd_pack(args):
 # --------------------------------------------------------------- session
 
 SESSIONS_PROJECT = "Claude Sessions"
+# A session log is a standing record, not a deadline. Created without a due
+# date the bridge stamps it with today's, so every log turns red the next
+# morning and lands in the owner's overdue count — noise on a task they were
+# asked not to touch.
+#
+# Both belt and braces, on purpose: `hasDueDate: false` is the real answer and
+# needs WorkFlow 4.6, while the parked date keeps 4.5 and earlier quiet. An
+# older app ignores the unknown field; a newer one ignores the date because
+# the task is undated. Drop the parked date once 4.6 is everywhere.
+SESSIONS_PARKED_DUE = "2027-09-01"
 SESSIONS_HANDS_OFF = ("Claude-maintained session log. The owner does not edit, tick, move or "
                       "delete anything in this project unless Claude specifically asks.")
 # Working-folder name -> task title, for folders that share a codebase task.
@@ -995,11 +1377,12 @@ def _week_sessions(days=7):
             continue
         seen.add(real)
         name = d.name
-        for prefix in ("-Users-alex-Desktop-", "-Users-alex-Developer-", "-Users-alex-Projects-", "-Users-alex-"):
+        home = "-" + str(Path.home()).strip("/").replace("/", "-")
+        for prefix in (home + "-Desktop-", home + "-Developer-", home + "-Projects-", home + "-"):
             if name.startswith(prefix):
                 name = name[len(prefix):]
                 break
-        if name == "-Users-alex-Desktop":
+        if name == home + "-Desktop":
             name = "Desktop"
         name = name.replace("---", " - ").replace("-", " ") or "Desktop"
         n = sum(1 for f in d.glob("*.jsonl") if f.stat().st_mtime >= cutoff)
@@ -1063,6 +1446,7 @@ def cmd_session(args):
             return
         send("create_task", title=title, project=SESSIONS_PROJECT,
              notes=SESSIONS_HANDS_OFF, tags=["claude-log"],
+             dueDate=SESSIONS_PARKED_DUE, hasDueDate=False,
              pinnedNote=args.state or f"First session {datetime.now():%Y-%m-%d}. No state written yet.",
              subtasks=args.open or None,
              text=args.log)
@@ -1121,9 +1505,13 @@ def cmd_handoff(args):
         notes = (notes + "\n\n" if notes else "") + "Run:\n" + "\n".join(args.command)
     send("create_smart_list", name=HANDOFF_LIST, icon="hand.raised",
          colorHex="#B85C38", filters={"tag": HANDOFF_TAG, "status": "To Do", "sort": "Due Date"})
+    # Undated unless a real deadline is given: with no dueDate the bridge
+    # stamps the creation time, and the hand-off is overdue by the next
+    # morning — the same noise SESSIONS_PARKED_DUE fixed for the session logs.
+    due = {"dueDate": args.due} if args.due else {"dueDate": SESSIONS_PARKED_DUE, "hasDueDate": False}
     send("create_task", title=args.title, project=args.project, notes=notes or None,
-         priority=args.priority, dueDate=args.due, assignee=OWNER,
-         tags=[HANDOFF_TAG], text=args.why)
+         priority=args.priority, assignee=OWNER,
+         tags=[HANDOFF_TAG], text=args.why, **due)
 
 
 def cmd_job(args):
@@ -1133,8 +1521,11 @@ def cmd_job(args):
     steps += args.step or []
     if not steps:
         die("no steps — pass --template " + "|".join(JOB_TEMPLATES) + " and/or --step")
+    # A job is a progress log, not a deadline: undated, like the session logs
+    # (an undated create_task gets today's date and is overdue tomorrow).
     send("create_task", title=args.title, project=SESSIONS_PROJECT, tags=["claude-log", "job"],
          status="In Progress", priority="Medium", notes=SESSIONS_HANDS_OFF,
+         dueDate=SESSIONS_PARKED_DUE, hasDueDate=False,
          pinnedNote=f"Started {datetime.now():%-d %b %Y %H:%M}. 0 of {len(steps)} steps.",
          subtasks=steps, text=args.why)
 
@@ -1208,7 +1599,11 @@ def wake_install(args):
     # with "env: node: No such file or directory". Resolve both the binary and
     # the PATH from the user's *login* shell and bake them into the config;
     # the scripts export that PATH before running anything.
-    login_path = os.popen("/bin/zsh -lic 'printf %s \"$PATH\"' 2>/dev/null").read().strip()
+    # An interactive login shell can print a banner first (Terminal's
+    # "Restored session: …" landed in WAKE_PATH on 5 Sep), so take the last
+    # line and keep only real directories.
+    raw_path = os.popen("/bin/zsh -lic 'printf \"\\n%s\" \"$PATH\"' 2>/dev/null").read().strip().splitlines()
+    login_path = ":".join(d for d in (raw_path[-1] if raw_path else "").split(":") if d.startswith("/"))
     claude_bin = args.claude or os.popen(
         "/bin/zsh -lic 'command -v claude' 2>/dev/null").read().strip().splitlines()[-1:]
     claude_bin = claude_bin[0] if isinstance(claude_bin, list) and claude_bin else (claude_bin or "")
@@ -1226,6 +1621,7 @@ def wake_install(args):
         f'LOG_FILE="{log_file}"\n'
         f'WAKE_PATH="{login_path}"\n'
         f'MODEL="{args.model or ""}"\n'
+        f'MAX_MINUTES="{args.max_minutes}"\n'
     )
 
     plist = {
@@ -1380,6 +1776,7 @@ def mail_parse(raw):
     if msg_id:
         link = "message://%3C" + msg_id.strip("<>") + "%3E"
     return {
+        "attachments": mail_attachment_names(msg),
         "id": msg_id or f"nomsgid:{sender}|{subject}|{msg.get('Date','')}",
         "subject": subject or "(no subject)",
         "from": sender,
@@ -1387,6 +1784,106 @@ def mail_parse(raw):
         "link": link,
         "preview": text,
     }
+
+
+def mail_attachment_names(msg):
+    """Names of the files a message carries, as far as the headers we have
+    show them. From a truncated peek this can miss files whose part starts
+    past the cut, so it is a hint for the listing, not an inventory."""
+    names = []
+    for part in (msg.walk() if msg.is_multipart() else [msg]):
+        if part.is_multipart():
+            continue
+        disposition = (part.get("Content-Disposition") or "").lower()
+        name = part.get_filename()
+        if not name and not disposition.startswith("attachment"):
+            continue
+        if not disposition.startswith("attachment") and part.get("Content-ID") and part.get_content_maintype() == "image":
+            continue   # an image the HTML body shows inline — a logo, mostly
+        if part.get_content_type() in ("application/pkcs7-signature", "application/x-pkcs7-signature",
+                                       "application/pgp-signature", "application/ms-tnef"):
+            continue
+        names.append(_decode_header(name) if name else "Attachment")
+    return names
+
+
+def mail_extract_attachments(raw):
+    """Every file in a full message: [(name, bytes)]. Same rules as the app's
+    MailAttachments (inline logos, signatures and TNEF wrappers are skipped;
+    repeated names get a number)."""
+    import email
+    from email import policy
+    msg = email.message_from_bytes(raw, policy=policy.compat32)
+    out, seen = [], {}
+
+    def leaves(part):
+        # A forwarded message is one file, as in the app: kept whole as .eml,
+        # never opened up into its own body and attachments.
+        if part.get_content_type() == "message/rfc822" and part is not msg:
+            yield part
+        elif part.is_multipart():
+            for child in part.get_payload():
+                yield from leaves(child)
+        else:
+            yield part
+
+    for part in leaves(msg):
+        disposition = (part.get("Content-Disposition") or "").lower()
+        name = part.get_filename()
+        ctype = part.get_content_type()
+        if ctype == "message/rfc822" and not name:
+            name = "Forwarded message.eml"
+        if not name and not disposition.startswith("attachment"):
+            continue
+        if not disposition.startswith("attachment") and part.get("Content-ID") and part.get_content_maintype() == "image":
+            continue
+        if ctype in ("application/pkcs7-signature", "application/x-pkcs7-signature",
+                     "application/pgp-signature", "application/ms-tnef"):
+            continue
+        if ctype == "message/rfc822":
+            inner = part.get_payload()
+            data = (inner[0] if isinstance(inner, list) and inner else part).as_bytes()
+        else:
+            data = part.get_payload(decode=True)
+        if not data or len(data) > 50 * 1024 * 1024:
+            continue
+        name = _decode_header(name) if name else "Attachment"
+        name = name.replace("/", "-").replace(":", "-").strip().lstrip(".") or "Attachment"
+        key = name.lower()
+        if key in seen:
+            seen[key] += 1
+            stem, dot, ext = name.rpartition(".")
+            name = f"{stem} ({seen[key]}).{ext}" if dot else f"{name} ({seen[key]})"
+        else:
+            seen[key] = 1
+        out.append((name, data))
+    return out
+
+
+def mail_fetch_full(message_id):
+    """One whole message by Message-ID, still read-only and PEEKed."""
+    import imaplib
+    cfg = _mail_config()
+    user = cfg["user"]
+    box = imaplib.IMAP4_SSL(cfg.get("host", "imap.mail.me.com"), 993)
+    try:
+        box.login(user, _mail_password(user))
+        if box.select("INBOX", readonly=True)[0] != "OK":
+            die("couldn't open INBOX")
+        wanted = message_id if message_id.startswith("<") else f"<{message_id}>"
+        status, data = box.search(None, "HEADER", "Message-ID", wanted)
+        uids = data[0].split() if status == "OK" and data and data[0] else []
+        if not uids:
+            die(f"no message with id {message_id} in the inbox")
+        status, parts = box.fetch(uids[-1], "(BODY.PEEK[])")
+        if status != "OK" or not parts or not isinstance(parts[0], tuple):
+            die("couldn't fetch the message")
+        return parts[0][1]
+    finally:
+        try:
+            box.logout()
+        except Exception:
+            pass
 
 
 def mail_fetch_unread(limit=50):
@@ -1449,6 +1946,22 @@ def cmd_mail(args):
         _mail_save_state(state)
         print(f"marked {len(args.ids)} handled")
         return
+    if sub == "attach":
+        # 5.0: an email's own files onto the task made from it.
+        task = find_task(args.task)
+        raw = mail_fetch_full(args.message_id)
+        info = mail_parse(raw)
+        files = mail_extract_attachments(raw)
+        if not files:
+            print("that message has no attachments")
+            return
+        ATTACHMENTS.mkdir(parents=True, exist_ok=True)
+        summary = f"Attached to the email “{info['subject']}”" + (f", sent {info['date']}" if info.get("date") else "")
+        for name, data in files:
+            staged = ATTACHMENTS / name
+            staged.write_bytes(data)
+            send("attach_file", taskID=task["id"], fileName=name, docAuthor=info["from"] or None, docSummary=summary)
+        return
     if sub == "install":
         mail_launchd_install(args)
         return
@@ -1477,7 +1990,8 @@ def cmd_mail(args):
         print("no unread messages" + (" that aren't already handled" if args.new else ""))
         return
     for r in rows:
-        print(f"{(r['date'] or '')[:16]:16}  {r['from'][:34]:34}  {r['subject'][:60]}")
+        clip = f"  📎 {len(r['attachments'])}" if r.get("attachments") else ""
+        print(f"{(r['date'] or '')[:16]:16}  {r['from'][:34]:34}  {r['subject'][:60]}{clip}")
         if args.verbose and r["preview"]:
             print("    " + r["preview"].replace("\n", "\n    ")[:400])
             print("    id " + r["id"])
@@ -1502,6 +2016,105 @@ def mail_launchd_install(args):
     print(f"installed  {MAIL_PLIST}  (every {args.every} min)")
     if rc != 0:
         print("launchctl bootstrap returned non-zero — check: launchctl print gui/$(id -u)/" + MAIL_LABEL)
+
+
+# ---------------------------------------------------------------- email (4.9.4)
+#
+# `wf email` is how a task that says "email Jane about the quote" gets done.
+# What it may do is the user's call, made in WorkFlow → Settings → Agent Bridge
+# → Email and published in snapshot.json:
+#
+#   off    nothing — refuses, exit 2
+#   draft  the message is filed on the task as an .eml draft; the user checks
+#          it and sends it from their own Mail with Review & Send
+#   send   `--send` may send it through the user's iCloud account (SMTP, the
+#          same app-specific password `wf mail setup` keeps in the Keychain),
+#          and a copy is filed on the task
+#
+# Even at `send`, a task is only ever drafted when it says "draft only"
+# (title, notes, pinned note, or one of the user's comments), or when it was
+# made from an incoming email — that email's words are a stranger's, and they
+# must never be able to make anything leave this Mac. The app enforces the
+# switch again on the `draft_email` it receives.
+
+EMAIL_ADDRESS = re.compile(r"^[^@\s,;<>]+@[^@\s,;<>]+\.[^@\s,;<>]+$")
+
+
+def email_permission(snapshot):
+    return ((snapshot or {}).get("permissions") or {}).get("email", "off")
+
+
+def email_draft_only_reason(task):
+    if task.get("fromEmail"):
+        return "this task was made from an incoming email, so it only ever gets a draft"
+    texts = [task.get("title", ""), task.get("notes", ""), task.get("pinnedNote", "")]
+    texts += [c.get("text", "") for c in task.get("comments", [])
+              if c.get("authorID") != AGENT_AUTHOR_ID and c.get("author") != AGENT_NAME]
+    if any(re.search(r"\bdraft[\s-]+only\b", t or "", re.I) for t in texts):
+        return "the task says “draft only”"
+    return None
+
+
+def smtp_send(to, cc, subject, body):
+    import smtplib, ssl
+    from email.message import EmailMessage
+    from email.utils import formatdate, make_msgid
+    cfg = _mail_config()
+    user = cfg["user"]
+    msg = EmailMessage()
+    msg["From"] = cfg.get("from", user)
+    msg["To"] = ", ".join(to)
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    msg["Subject"] = subject
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=user.split("@")[-1])
+    msg.set_content(body)
+    host = cfg.get("smtp_host", "smtp.mail.me.com")
+    with smtplib.SMTP(host, 587, timeout=30) as s:
+        s.starttls(context=ssl.create_default_context())
+        s.login(user, _mail_password(user))
+        s.send_message(msg)
+
+
+def cmd_email(args):
+    snapshot = load_snapshot()
+    level = email_permission(snapshot)
+    if snapshot is not None and "permissions" not in snapshot:
+        die("this WorkFlow predates email permissions — update it to 4.9.4 or later", 2)
+    if level == "off":
+        die("email is switched off — WorkFlow → Settings → Agent Bridge → Email", 2)
+    task = find_task(args.task)
+    to = [a.strip() for a in args.to if a.strip()]
+    cc = [a.strip() for a in (args.cc or []) if a.strip()]
+    for a in to + cc:
+        if not EMAIL_ADDRESS.match(a):
+            die(f"“{a}” isn't a single email address")
+    subject = args.subject.strip()
+    if not subject or "\n" in subject or "\r" in subject:
+        die("need a one-line --subject")
+    body = Path(args.body_file).expanduser().read_text() if args.body_file else (args.body or "")
+    if not body.strip():
+        die("need --body or --body-file")
+
+    send_it = args.send
+    if send_it and level != "send":
+        print("wf: email is set to Draft Only — filing a draft instead", file=sys.stderr)
+        send_it = False
+    if send_it:
+        reason = email_draft_only_reason(task)
+        if reason:
+            print(f"wf: {reason} — filing a draft instead", file=sys.stderr)
+            send_it = False
+
+    if send_it:
+        try:
+            smtp_send(to, cc, subject, body)
+        except Exception as e:  # nothing is recorded as sent unless it was
+            die(f"sending failed, nothing was sent: {e}\n     re-run without --send to file a draft", 2)
+        print(f"sent to {', '.join(to + cc)}")
+    send("draft_email", taskID=task["id"], emailTo=to, emailCc=cc or None,
+         emailSubject=subject, emailBody=body, emailSent=True if send_it else None)
 
 
 def main():
@@ -1559,10 +2172,95 @@ def main():
     p.add_argument("new")
     p.set_defaults(func=cmd_rename)
 
+    p = sub.add_parser("edit", help="change an existing task's title, notes, tags, …")
+    p.add_argument("task")
+    p.add_argument("--title")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--notes", help="replace the notes ('' clears them)")
+    g.add_argument("--notes-file", help="replace the notes with a file's text")
+    p.add_argument("--append-notes", metavar="TEXT",
+                   help="add to the end of the notes, keeping the user's formatting")
+    p.add_argument("--priority", choices=["High", "Medium", "Low"])
+    p.add_argument("--status", help="To Do / In Progress / Completed")
+    p.add_argument("--assignee", help="'' unassigns")
+    p.add_argument("--project", help="'' removes it from its project")
+    p.add_argument("--add-tag", action="append", help="repeatable")
+    p.add_argument("--remove-tag", action="append", help="repeatable")
+    md = p.add_mutually_exclusive_group()
+    md.add_argument("--my-day", dest="my_day", action="store_const", const=True)
+    md.add_argument("--no-my-day", dest="my_day", action="store_const", const=False)
+    p.set_defaults(func=cmd_edit)
+
+    p = sub.add_parser("subtask", help="add or remove checklist rows on an existing task")
+    p.add_argument("task")
+    p.add_argument("action", choices=["add", "remove"])
+    p.add_argument("items", nargs="+",
+                   help="titles; remove takes an exact title or a fragment only one row contains")
+    p.set_defaults(func=cmd_subtask)
+
+    p = sub.add_parser("docs", help="list or search documents (names, profiles, text inside)")
+    p.add_argument("query", nargs="?")
+    p.add_argument("--project")
+    p.add_argument("--type")
+    p.add_argument("--status")
+    p.add_argument("--limit", type=int, default=40)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_docs)
+
+    p = sub.add_parser("doc", help="one document: profile, versions, start of its text")
+    p.add_argument("doc", help="WF-number, id, or file name")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_doc)
+
+    def profile_args(p, with_name=True):
+        if with_name:
+            p.add_argument("--name", help="rename the current file")
+        p.add_argument("--type", help="Contract, Invoice, Letter, … or your own")
+        p.add_argument("--status", help="Draft, In Review, Final, Signed, Superseded")
+        p.add_argument("--author")
+        p.add_argument("--description")
+        p.add_argument("--folder", help="workspace folder; a/b nests; '' unfiles")
+
+    p = sub.add_parser("doc-set", help="change a document's profile or folder")
+    p.add_argument("doc")
+    profile_args(p)
+    p.set_defaults(func=cmd_doc_set)
+
+    p = sub.add_parser("doc-version", help="upload a new version of a document")
+    p.add_argument("doc")
+    p.add_argument("file")
+    p.add_argument("--comment", help="what changed")
+    p.set_defaults(func=cmd_doc_version)
+
+    p = sub.add_parser("file", help="file a document into a project's workspace")
+    p.add_argument("project")
+    p.add_argument("file")
+    profile_args(p)
+    p.set_defaults(func=cmd_file)
+
     p = sub.add_parser("status", help="set a task's pinned note")
     p.add_argument("task")
     p.add_argument("text")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("agenda", help="what is overdue, due today and coming up")
+    p.add_argument("action", nargs="?", choices=["install", "status", "uninstall"],
+                   help="manage the daily launchd job")
+    p.add_argument("--at", help="install: time of day, HH:MM (default 08:00)")
+    p.add_argument("--triage", action="store_true",
+                   help="install: also wake a session when something is overdue")
+    p.add_argument("--days", type=int, default=7, help="horizon for 'next up' (default 7)")
+    p.add_argument("--limit", type=int, default=5, help="items listed per bucket (default 5)")
+    p.add_argument("--json", action="store_true", help="machine-readable, for an agent")
+    p.add_argument("--post", metavar="TASK", help="also post the digest as a comment on TASK")
+    p.set_defaults(func=cmd_agenda)
+
+    p = sub.add_parser("due", help="set a task's due date, or 'park' it a year out")
+    p.add_argument("task")
+    p.add_argument("date",
+                   help="yyyy-MM-dd, ISO-8601, 'none' (no due date at all, needs 4.6), "
+                        "or 'park' (%s)" % SESSIONS_PARKED_DUE)
+    p.set_defaults(func=cmd_due)
 
     p = sub.add_parser("done", help="complete a task")
     p.add_argument("task")
@@ -1573,7 +2271,15 @@ def main():
     p.add_argument("--icon")
     p.add_argument("--color", help="#RRGGBB")
     p.add_argument("--description")
+    p.add_argument("--status", help="planning, active, on hold, done (5.1)")
+    p.add_argument("--start", help="planned start, yyyy-MM-dd, or 'none' (5.1)")
+    p.add_argument("--target", help="target date, yyyy-MM-dd, or 'none' (5.1)")
     p.set_defaults(func=cmd_project)
+
+    p = sub.add_parser("projects", help="the portfolio: status, plan and health of every project")
+    p.add_argument("--all", action="store_true", help="include archived")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_projects)
 
     p = sub.add_parser("pack", help="install a ProjectPack JSON file")
     p.add_argument("file")
@@ -1592,6 +2298,9 @@ def main():
     q = ms.add_parser("setup", help="store the app-specific password in the Keychain")
     q.add_argument("address")
     q.add_argument("--host", default="imap.mail.me.com")
+    q = ms.add_parser("attach", help="attach a message's files to a task (fetches it in full, read-only)")
+    q.add_argument("message_id")
+    q.add_argument("task")
     q = ms.add_parser("mark", help="record message ids as handled")
     q.add_argument("ids", nargs="+")
     q = ms.add_parser("install", help="launchd runner: hand new unread mail to a session")
@@ -1599,6 +2308,17 @@ def main():
     ms.add_parser("uninstall")
     ms.add_parser("status")
     p.set_defaults(func=cmd_mail)
+
+    p = sub.add_parser("email", help="draft (or, if allowed, send) an email a task asks for")
+    p.add_argument("task")
+    p.add_argument("--to", action="append", required=True, help="repeat for several")
+    p.add_argument("--cc", action="append")
+    p.add_argument("--subject", required=True)
+    p.add_argument("--body")
+    p.add_argument("--body-file")
+    p.add_argument("--send", action="store_true",
+                   help="send it now — only when Settings allows Can Send and the task doesn't say draft only")
+    p.set_defaults(func=cmd_email)
 
     p = sub.add_parser("notes", help="the Notepad inbox")
     p.add_argument("--all", action="store_true", help="include archived")
@@ -1652,6 +2372,8 @@ def main():
     p.add_argument("--claude", help="path to the claude binary")
     p.add_argument("--model", help="model for unattended sessions (e.g. opus); "
                                    "default lets the CLI choose, which can hit a usage limit")
+    p.add_argument("--max-minutes", type=int, default=60,
+                   help="stop an unattended session after this long and say so in the task (default 60)")
     p.set_defaults(func=cmd_wake)
 
     p = sub.add_parser("poll", help="comments addressed to the agent")

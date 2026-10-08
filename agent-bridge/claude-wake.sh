@@ -37,6 +37,14 @@ SEEN_FILE="$HERE/.wake-seen"
 
 log() { echo "$(date -Iseconds) $*" >> "$LOG_FILE"; }
 
+# Signals a process and everything under it, children first: the thing stuck
+# on a dialog is usually a child (an osascript), not the session itself.
+killtree() {
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null); do killtree "$child" "$2"; done
+  kill "-$2" "$1" 2>/dev/null
+}
+
 # Everything below runs inside a function on purpose: bash parses a function
 # body in one read, so editing this file while a session is running can't
 # shift the offsets under the running shell. (7 Sep: an edit mid-session
@@ -106,9 +114,21 @@ Do the work, then report back in the task's own thread so it reaches the
 user's phone:
   $HERE/wf status  <id> "one-line status"       # the pinned status line
   $HERE/wf check   <id> "<subtask title>"       # tick progress off
+  $HERE/wf subtask <id> add "<title>"          # add checklist rows
+  $HERE/wf edit    <id> --append-notes "..."    # add to the notes (keeps formatting)
+  $HERE/wf docs "<words>"                       # find a document, even by text inside it
+  $HERE/wf doc-set <WF-number> --type Contract --status Final --folder "Contracts"
   $HERE/wf comment <id> "what you did, or what you need"
 
 If a task is finished:  $HERE/wf done <id>
+
+If a task asks you to email someone, never use any other mail route:
+  $HERE/wf email <id> --to a@b.com --subject "..." --body-file draft.txt
+That files a draft the user sends with Review & Send. Add --send only when
+the task plainly asks you to send it yourself; wf still drafts instead when
+the user's Email setting is Draft Only, when the task says "draft only", or
+when the task was made from an incoming email. If wf says email is switched
+off, say so in the thread and stop.
 
 How to write into a thread (it is read on a phone):
   - One reply per request, at most about six short lines. Lead with what
@@ -118,6 +138,13 @@ How to write into a thread (it is read on a phone):
     longer than a screen. Link to it from the reply.
   - Never repeat what the thread already says; never paste logs or code.
 If you need something from the user, ask in the comment and leave it open.
+
+Nobody is at the Mac while you run. Never do anything that puts up a window
+or a macOS permission dialog: no AppleScript or osascript, no \`open\`, no
+driving Mail, Finder, System Events or any other app, and no reaching into
+Desktop, Documents, Downloads, iCloud Drive or /Volumes if you haven't been
+there before. A dialog would sit unanswered and stall this session until it is
+stopped. If a task needs any of that, say so in its thread and move on.
 PROMPTEOF
 
 cd "$WORK_DIR" || { log "work dir missing: $WORK_DIR"; exit 1; }
@@ -133,17 +160,51 @@ echo "$SEQ" > "$SEEN_FILE"
 BEFORE=$(ls -1 "$BRIDGE_ROOT/processed" 2>/dev/null | wc -l | tr -d ' ')
 
 SESSION_LOG=$(mktemp -t claude-wake-session)
+# Nothing that can raise a macOS dialog: with nobody at the Mac, an
+# Automation or files prompt ("claude wants to control Mail") sat unanswered
+# and held sessions for 7 and 10 hours (9 and 21 Sep). The prompt says the
+# same in words; this makes the obvious routes fail fast instead.
+ARGS=(-p "$PROMPT" --disallowedTools "Bash(osascript:*),Bash(open:*),Bash(automator:*),Bash(shortcuts:*)")
 # MODEL is optional (set by `wf wake install --model`). Without it the CLI
 # picks its default, which is what hit a usage limit on 7 Sep and returned
 # exit 1 having written nothing.
-if [[ -n "${MODEL:-}" ]]; then
-  "$CLAUDE_BIN" -p "$PROMPT" --model "$MODEL" > "$SESSION_LOG" 2>&1
-else
-  "$CLAUDE_BIN" -p "$PROMPT" > "$SESSION_LOG" 2>&1
-fi
+[[ -n "${MODEL:-}" ]] && ARGS+=(--model "$MODEL")
+
+# A time limit, so a session stuck on anything is stopped and reported rather
+# than left running all day. MAX_MINUTES comes from `wf wake install
+# --max-minutes`; 60 covers the longest real session so far with room.
+LIMIT_MIN="${MAX_MINUTES:-60}"
+LIMIT_SEC="${MAX_SECONDS:-$((LIMIT_MIN * 60))}"   # seconds: for testing
+TIMED_OUT="$SESSION_LOG.timedout"
+"$CLAUDE_BIN" "${ARGS[@]}" > "$SESSION_LOG" 2>&1 &
+CPID=$!
+(
+  sleep "$LIMIT_SEC" || exit 0
+  kill -0 "$CPID" 2>/dev/null || exit 0
+  touch "$TIMED_OUT"
+  killtree "$CPID" TERM
+  sleep 15
+  killtree "$CPID" KILL
+) &
+WATCHDOG=$!
+wait "$CPID"
 STATUS=$?
+pkill -P "$WATCHDOG" 2>/dev/null; kill "$WATCHDOG" 2>/dev/null
 cat "$SESSION_LOG" >> "$LOG_FILE"
 log "session exited $STATUS"
+
+if [[ -f "$TIMED_OUT" ]]; then
+  rm -f "$TIMED_OUT"
+  log "session for wake $SEQ STOPPED after $LIMIT_MIN minutes"
+  # Not retried: it may have done part of the work. The likeliest cause is a
+  # macOS dialog nobody could answer, so say where to look.
+  FIRST_ID=$(/usr/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["tasks"][0]["id"] if d.get("tasks") else "")' "$WAKE_FILE" 2>/dev/null)
+  if [[ -n "$FIRST_ID" ]]; then
+    "$HERE/wf" comment "$FIRST_ID" "I was stopped after $LIMIT_MIN minutes without finishing. The usual cause is a macOS permission dialog on the Mac that nobody could answer. If one is showing, choose Don't Allow unless you want background sessions to have that access. Anything I finished is recorded above. Mention me again to pick this up." >/dev/null 2>&1 || true
+  fi
+  rm -f "$SESSION_LOG"
+  exit 0
+fi
 
 if [[ $STATUS -ne 0 ]]; then
   AFTER=$(ls -1 "$BRIDGE_ROOT/processed" 2>/dev/null | wc -l | tr -d ' ')
